@@ -1,0 +1,32 @@
+name: Build ankimarkable
+on: [workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Clean Rust Environment
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler python3-pip
+          pip3 install ziglang --break-system-packages
+          cargo install cargo-zigbuild
+
+      - name: Compile Application
+        run: |
+          export PROTOC="$(command -v protoc)"
+          cargo zigbuild --target aarch64-unknown-linux-musl --release
+
+      - name: Upload Finished Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ankimarkable-binary
+          path: target/aarch64-unknown-linux-musl/release/ankimarkable
