@@ -1,32 +1,56 @@
-name: Build ankimarkable
-on: [workflow_dispatch]
+name: Build AnkiMarkable
+
+on:
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
 
-      - name: Set up Clean Rust Environment
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler \
+            curl \
+            git \
+            build-essential
+
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler python3-pip
-          pip3 install ziglang --break-system-packages
-          cargo install cargo-zigbuild
-
-      - name: Compile Application
-        run: |
-          export PROTOC="$(command -v protoc)"
-          cargo zigbuild --target aarch64-unknown-linux-musl --release
-
-      - name: Upload Finished Binary
-        uses: actions/upload-artifact@v4
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
         with:
-          name: ankimarkable-binary
-          path: target/aarch64-unknown-linux-musl/release/ankimarkable
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
+
+      - name: Build AnkiMarkable
+        env:
+          PROTOC: /usr/bin/protoc
+        run: |
+          cargo zigbuild \
+            --target aarch64-unknown-linux-musl \
+            --release
+
+      - name: Show build output
+        run: |
+          find target/aarch64-unknown-linux-musl/release \
+            -maxdepth 1 \
+            -type f \
+            -printf '%p\n'
+
+      - name: Upload application
+        uses: actions/upload-artifact@v6
+        with:
+          name: ankimarkable
+          path: |
+            target/aarch64-unknown-linux-musl/release/ankimarkable
