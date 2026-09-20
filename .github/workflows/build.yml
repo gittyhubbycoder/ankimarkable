@@ -9,16 +9,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             protobuf-compiler \
-            curl \
-            git \
-            build-essential
+            build-essential \
+            pkg-config
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,7 +30,8 @@ jobs:
           version: 0.13.0
 
       - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild
+        run: |
+          cargo install cargo-zigbuild
 
       - name: Build AnkiMarkable
         env:
@@ -41,16 +41,30 @@ jobs:
             --target aarch64-unknown-linux-musl \
             --release
 
-      - name: Show build output
+      - name: Check binary
         run: |
-          find target/aarch64-unknown-linux-musl/release \
-            -maxdepth 1 \
-            -type f \
-            -printf '%p\n'
+          file target/aarch64-unknown-linux-musl/release/ankimarkable
+          ls -lh target/aarch64-unknown-linux-musl/release/ankimarkable
+
+      - name: Prepare package
+        run: |
+          mkdir -p package
+
+          cp target/aarch64-unknown-linux-musl/release/ankimarkable package/
+
+          if [ -f icon.png ]; then
+            cp icon.png package/
+          fi
+
+          if [ -f external.manifest.json ]; then
+            cp external.manifest.json package/
+          fi
+
+          echo "=== PACKAGE ==="
+          find package -maxdepth 2 -type f -print
 
       - name: Upload application
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: ankimarkable
-          path: |
-            target/aarch64-unknown-linux-musl/release/ankimarkable
+          path: package/
