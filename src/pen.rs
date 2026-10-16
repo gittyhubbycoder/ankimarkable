@@ -198,9 +198,8 @@ impl Pen {
         let sz = std::mem::size_of::<InputEvent>();
         let mut buf = [0u8; std::mem::size_of::<InputEvent>() * 64];
         loop {
-            let n = unsafe {
-                libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
+            let n =
+                unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 return match e.raw_os_error() {
@@ -209,12 +208,14 @@ impl Pen {
                 };
             }
             if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "marker closed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "marker closed",
+                ));
             }
             let count = (n as usize) / sz;
             for i in 0..count {
-                let ev: &InputEvent =
-                    unsafe { &*(buf.as_ptr().add(i * sz) as *const InputEvent) };
+                let ev: &InputEvent = unsafe { &*(buf.as_ptr().add(i * sz) as *const InputEvent) };
                 self.activity = true;
                 match ev.type_ {
                     EV_ABS => match ev.code {
@@ -287,9 +288,7 @@ impl Drop for Pen {
 
 fn abs_max(fd: RawFd, axis: u16) -> Option<i32> {
     let mut info = [0i32; 6]; // value,min,max,fuzz,flat,resolution
-    let rc = unsafe {
-        libc::ioctl(fd, eviocgabs(axis), info.as_mut_ptr() as *mut libc::c_void)
-    };
+    let rc = unsafe { libc::ioctl(fd, eviocgabs(axis), info.as_mut_ptr() as *mut libc::c_void) };
     if rc >= 0 && info[2] > info[1] {
         Some(info[2])
     } else {

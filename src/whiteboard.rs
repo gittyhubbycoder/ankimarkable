@@ -18,12 +18,12 @@
 //! reflow, so ink anchors to CSS *positions*, not to re-wrapped words; and a
 //! stroke drawn at 2× renders proportionally thin at 1×.
 //!
-//! Ink is confined to the card region (`ui::CARD_Y .. CARD_Y+CARD_H`); pen samples
-//! over the top/bottom chrome are ignored so writing never spills onto the bars.
+//! Ink is confined to the input pad (`ui::INK_Y .. ui::INK_Y+INK_H`); pen samples
+//! over the header, transcript, and action buttons are ignored.
 
 use crate::pen::PenSample;
 use crate::qtfb::{Qtfb, REFRESH_MODE_ANIMATE, REFRESH_MODE_CONTENT, REFRESH_MODE_FAST};
-use crate::ui::{CARD_H, CARD_Y, HEIGHT, WIDTH};
+use crate::ui::{HEIGHT, INK_H, INK_Y, WIDTH};
 
 /// Eraser brush radius (px) — much larger than a pen stroke so the eraser end
 /// clears meaningfully, matching the scratchpad feel.
@@ -57,10 +57,11 @@ pub struct Whiteboard {
     // back with the ink kept crisp.
     settle: Option<(i32, i32, i32, i32)>,
     pub eraser: bool,
+    ink_visible: bool,
 }
 
 fn in_card(y: i32) -> bool {
-    y >= CARD_Y as i32 && y < (CARD_Y + CARD_H) as i32
+    y >= INK_Y as i32 && y < (INK_Y + INK_H) as i32
 }
 
 impl Whiteboard {
@@ -76,6 +77,7 @@ impl Whiteboard {
             dirty: None,
             settle: None,
             eraser: false,
+            ink_visible: true,
         }
     }
 
@@ -83,7 +85,12 @@ impl Whiteboard {
         !self.strokes.is_empty() || self.active.is_some()
     }
 
-    /// Replace the base frame (e.g. after composing the answer side). Ink is kept.
+    /// Hide or reveal preserved ink when switching between pad and keyboard mode.
+    pub fn set_ink_visible(&mut self, visible: bool) {
+        self.ink_visible = visible;
+    }
+
+    /// Replace the base frame (e.g. after composing chat chrome). Ink is kept.
     pub fn set_base(&mut self, frame: Vec<u8>) {
         debug_assert_eq!(frame.len(), self.base.len());
         self.base = frame;
@@ -112,7 +119,7 @@ impl Whiteboard {
         self.rebuild_ink();
     }
 
-    /// Drop all ink + strokes (used when advancing to the next card).
+    /// Clear the written input pad after a request completes or the user resets it.
     pub fn clear_ink(&mut self) {
         self.strokes.clear();
         self.active = None;
@@ -155,7 +162,11 @@ impl Whiteboard {
         for idx in 0..(WIDTH * HEIGHT) {
             let bi = idx * 4;
             let di = idx * 3;
-            let cov = self.ink[idx] as u32;
+            let cov = if self.ink_visible {
+                self.ink[idx] as u32
+            } else {
+                0
+            };
             if cov == 0 {
                 shm[di] = self.base[bi];
                 shm[di + 1] = self.base[bi + 1];
@@ -175,16 +186,55 @@ impl Whiteboard {
         self.settle = None;
     }
 
-    /// Push ONLY the card band (base + ink) with a fast DU partial refresh — the
-    /// scroll-step hot path. Non-blocking: if the e-ink server is behind, the frame
-    /// is in shm and the next step (or the colour settle) will show it. DU (not A2)
-    /// because the band is card CONTENT — grayscale/images — not just ink.
-    pub fn blit_band_fast(&mut self, qtfb: &mut Qtfb) {
+    /// Refresh the transcript after a scroll while preserving the pad and chrome.
+    pub fn blit_transcript_fast(&mut self, qtfb: &mut Qtfb) {
         let shm: &mut [u8] = &mut *qtfb.shm;
-        for idx in (CARD_Y * WIDTH)..((CARD_Y + CARD_H) * WIDTH) {
+        for idx in (INK_Y * WIDTH)..((INK_Y + INK_H) * WIDTH) {
             let bi = idx * 4;
             let di = idx * 3;
             let cov = self.ink[idx] as u32;
+            if cov == 0 {
+                shm[di..di + 3].copy_from_slice(&self.base[bi..bi + 3]);
+            } else {
+                let ia = 255 - cov;
+                for k in 0..3 {
+                    shm[di + k] = ((self.base[bi + k] as u32 * ia) / 255) as u8;
+                }
+            }
+        }
+        for idx in (crate::ui::CARD_Y * WIDTH)..((crate::ui::CARD_Y + crate::ui::CARD_H) * WIDTH) {
+            let bi = idx * 4;
+            let di = idx * 3;
+            let cov = self.ink[idx] as u32;
+            if cov == 0 {
+                shm[di..di + 3].copy_from_slice(&self.base[bi..bi + 3]);
+            } else {
+                let ia = 255 - cov;
+                for k in 0..3 {
+                    shm[di + k] = ((self.base[bi + k] as u32 * ia) / 255) as u8;
+                }
+            }
+        }
+        let _ = qtfb.try_set_refresh_mode(REFRESH_MODE_FAST);
+        let _ = qtfb.try_update_partial(
+            0,
+            crate::ui::CARD_Y as i32,
+            WIDTH as i32,
+            crate::ui::CARD_H as i32,
+        );
+    }
+
+    /// Push ONLY the input pad (base + ink) with a fast partial refresh.
+    pub fn blit_band_fast(&mut self, qtfb: &mut Qtfb) {
+        let shm: &mut [u8] = &mut *qtfb.shm;
+        for idx in (INK_Y * WIDTH)..((INK_Y + INK_H) * WIDTH) {
+            let bi = idx * 4;
+            let di = idx * 3;
+            let cov = if self.ink_visible {
+                self.ink[idx] as u32
+            } else {
+                0
+            };
             if cov == 0 {
                 shm[di] = self.base[bi];
                 shm[di + 1] = self.base[bi + 1];
@@ -197,9 +247,9 @@ impl Whiteboard {
             }
         }
         let _ = qtfb.try_set_refresh_mode(REFRESH_MODE_FAST);
-        let _ = qtfb.try_update_partial(0, CARD_Y as i32, WIDTH as i32, CARD_H as i32);
-        // The DU pass dropped colour over the whole band — queue a colour settle.
-        self.settle = Some((0, CARD_Y as i32, (WIDTH - 1) as i32, (CARD_Y + CARD_H - 1) as i32));
+        let _ = qtfb.try_update_partial(0, INK_Y as i32, WIDTH as i32, INK_H as i32);
+        // Only the pad is monochrome; full redraws restore the base without a settle.
+        self.settle = None;
         self.dirty = None; // superseded: the whole band was just pushed
     }
 
@@ -233,7 +283,7 @@ impl Whiteboard {
                 // truncates like the capture path did, so a stroke replayed at the
                 // zoom it was drawn at is pixel-identical to its live render.
                 let x = (cx as f32 * zoom).round() as i32;
-                let y = ((cy as f32 - scroll) * zoom).round() as i32 + CARD_Y as i32;
+                let y = ((cy as f32 - scroll) * zoom).round() as i32 + INK_Y as i32;
                 let r = (((w as f32) * zoom) as i32 / 2).max(1);
                 let (fx, fy) = prev.unwrap_or((x, y));
                 // segment_ink clips to the card band per-stamp, so segments that
@@ -250,6 +300,9 @@ impl Whiteboard {
     /// refresh) is what makes inking smooth: a QTFB partial-refresh per sample can't
     /// keep up with the pen's sample rate and reads as laggy/jittery.
     pub fn ink_sample(&mut self, s: PenSample, qtfb: &mut Qtfb) {
+        if !self.ink_visible {
+            return;
+        }
         if s.up {
             if let Some(st) = self.active.take() {
                 if !st.pts.is_empty() {
@@ -287,9 +340,9 @@ impl Whiteboard {
         segment_ink(&mut self.ink, fx, fy, x, y, r, erasing);
         let pad = r + 1;
         minx = (minx - pad).max(0);
-        miny = (miny - pad).max(CARD_Y as i32);
+        miny = (miny - pad).max(INK_Y as i32);
         maxx = (maxx + pad).min((WIDTH - 1) as i32);
-        maxy = (maxy + pad).min((CARD_Y + CARD_H - 1) as i32);
+        maxy = (maxy + pad).min((INK_Y + INK_H - 1) as i32);
 
         // 2. recompute the framebuffer over that bbox from base+ink (no refresh).
         {
@@ -320,8 +373,12 @@ impl Whiteboard {
         {
             let zoom = self.zoom;
             let cx = ((x as f32) / zoom).round() as i32;
-            let cy = (((y - CARD_Y as i32) as f32) / zoom + self.scroll).round() as i32;
-            let wpanel = if erasing { (ERASE_RADIUS * 2) as f32 } else { s.w as f32 };
+            let cy = (((y - INK_Y as i32) as f32) / zoom + self.scroll).round() as i32;
+            let wpanel = if erasing {
+                (ERASE_RADIUS * 2) as f32
+            } else {
+                s.w as f32
+            };
             let wrec = (wpanel / zoom).max(1.0) as u8;
             if let Some(st) = self.active.as_mut() {
                 st.pts.push((cx, cy, wrec));
@@ -386,6 +443,28 @@ impl Whiteboard {
             let _ = qtfb.set_refresh_mode(REFRESH_MODE_CONTENT);
             let _ = qtfb.update_partial(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
         }
+    }
+
+    /// True if any pen coverage exists on the pad.
+    pub fn ink_present(&self) -> bool {
+        self.ink.iter().any(|coverage| *coverage != 0)
+    }
+
+    /// Export the full whiteboard pad as opaque white/black RGBA pixels. This
+    /// reuses the authoritative ink coverage buffer and does no screen readback.
+    pub fn ink_image(&self) -> (usize, usize, Vec<u8>) {
+        let mut rgba = vec![255u8; WIDTH * INK_H * 4];
+        for y in 0..INK_H {
+            let src_row = (INK_Y + y) * WIDTH;
+            let dst_row = y * WIDTH;
+            for x in 0..WIDTH {
+                let coverage = self.ink[src_row + x];
+                let i = (dst_row + x) * 4;
+                let gray = 255 - coverage;
+                rgba[i..i + 4].copy_from_slice(&[gray, gray, gray, 255]);
+            }
+        }
+        (WIDTH, INK_H, rgba)
     }
 
     /// True while a pen stroke is in progress — used for palm rejection (ignore

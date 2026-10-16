@@ -211,8 +211,12 @@ impl Qtfb {
             return Err(e);
         }
 
-        let (shm_key, shm_size) =
-            unsafe { (resp.contents.init.shm_key_defined, resp.contents.init.shm_size) };
+        let (shm_key, shm_size) = unsafe {
+            (
+                resp.contents.init.shm_key_defined,
+                resp.contents.init.shm_size,
+            )
+        };
         let shm_name = format!("/dev/shm/qtfb_{shm_key}");
         let file = OpenOptions::new().read(true).write(true).open(&shm_name)?;
         let shm_ptr = unsafe {

@@ -1,102 +1,165 @@
-# ankimarkable — Anki for the reMarkable Paper Pro
+# OpenRouter Chat — reMarkable Paper Pro
 
-A native **Anki review client for the reMarkable Paper Pro** — Anki's real Rust
-backend (`rslib`), genuine AnkiWeb sync, full HTML/CSS card rendering, LaTeX math,
-and an AnkiDroid-style **pen whiteboard** so you write your answer before revealing
-it. Ships as a standalone [AppLoad](https://github.com/asivery/rm-appload) app: no
-xochitl injection, no boot-bank risk.
+Chat with any [OpenRouter](https://openrouter.ai) model directly on your
+reMarkable Paper Pro. It runs as a standalone external process under
+[XOVI](https://github.com/asivery/xovi) +
+[AppLoad](https://github.com/asivery/rm-appload) — no xochitl injection, no
+boot-bank risk.
 
-A ready-to-install bundle (binary + math helper + fonts + manual) is sold at
-[bazaar.abaj.ai/p/ankimarkable](https://bazaar.abaj.ai/p/ankimarkable); building from
-this source is and always will be possible.
+- **Pen whiteboard input** — write your prompt with the marker on a low-latency
+  ink pad, then send it as transcribed text (*Send Ink-to-Text*) or as a raw
+  image (*Send Image*, an inline `image_url` payload).
+- **On-screen keyboard** — toggle a touch QWERTY keyboard and type a normal
+  text prompt.
+- **Model picker** — the app loads every model from your OpenRouter account;
+  tap the header arrows to step through them, or tap the model name to jump
+  straight to a model.
+- **Markdown answers** — assistant replies render as real Markdown (headings,
+  lists, code blocks, tables) through the on-device blitz/stylo HTML engine.
+- **Scrollable transcript** — tap the upper half of the chat area to scroll up,
+  the lower half to scroll down.
 
-<p align="center">
-  <img src="docs/side-by-side.png" width="96%" alt="Left: colour-mode review screen — HMM card with inline LaTeX, deck counts with active-queue underline, coloured grade bar. Right: black-and-white mode — a handwritten F-statistic worked on the pen whiteboard over the card, grade bar desaturated.">
-</p>
+---
 
-*Left: a card with inline LaTeX rendered on-device, in **colour mode** (note the
-coloured grade bar). Right: the same app in **black-and-white mode** — tap the
-deck counts (top-left) to switch; the whole frame desaturates, which many people
-prefer for text-heavy decks on e-ink — with an answer being worked out by hand
-on the pen whiteboard before revealing.*
+## Install
 
-## Features
+You need [xovi](https://github.com/asivery/xovi) and
+[rm-appload](https://github.com/asivery/rm-appload) installed on the device
+first (one-time, free). Then either download a release or build it yourself.
 
-- **Real Anki, not a viewer** — the actual `rslib` backend: a true `.anki2`
-  collection, the FSRS scheduler with per-grade interval previews, and genuine
-  **AnkiWeb sync** (incremental + automatic full-download recovery, media included).
-- **Pen whiteboard over every card** — low-latency A2-waveform inking with the
-  marker, pressure-sensitive width, working **eraser end**, stroke undo, and palm
-  rejection. Ink persists through Show Answer so you can compare, and clears on grade.
-- **LaTeX / MathJax math** — `\(...\)`, `\[...\]` and `[latex]` blocks render
-  on-device via a bundled MicroTeX helper: fractions, big operators, `\perp`,
-  `\stackrel`, `\boldsymbol`, blackboard/calligraphic letters. Inline math is
-  baseline-aligned with the text; display math renders at natural size. TikZ
-  diagrams appear via Anki desktop's own pre-rendered SVGs.
-- **Full card fidelity** — cards render with their own HTML/CSS templates (pure-Rust
-  blitz/stylo stack, embedded fonts), including images from your media collection.
-- **Two-finger scroll + pinch-zoom** — long cards pan with a two-finger drag
-  (fast partial refreshes while you move, one clean colour pass when you stop;
-  your ink scrolls with the card). Pinch snaps between 1.0×/1.25×/1.5×/2.0× with
-  a real reflow — text gets bigger *and rewraps to the card width*, so nothing
-  hangs off-screen. One finger on the card still does nothing (palm safety).
-  The zoom step you settle on is remembered: every later card (and the answer
-  side) opens at that level, across relaunches too.
-- **Home screen** — collapsible deck tree with due counts, review streak, and
-  tap-to-review any deck.
-- **Colour ↔ black-and-white toggle** — tap the deck counts (top-left) to flip
-  the whole frame between full colour and desaturated grayscale. Colour is great
-  for image-heavy decks; B&W renders text crisper on e-ink and avoids the colour
-  panel's slower settle. The mode is remembered across cards *and* relaunches,
-  and is unmissable when toggled (the grade bar changes with it — see the
-  screenshots above).
-- **Review chrome** — new/learning/review counts with an underline marking the
-  current card's queue; Undo (strokes first, then the last grade); an overflow menu
-  for **bury card / suspend note**; colour-e-ink-aware refresh (fast mono inking +
-  debounced colour settle, no flashing).
-- **Safe by construction** — an external AppLoad process talking to the QTFB
-  framebuffer. It cannot crash-loop xochitl or flip your boot bank.
+### Option A — download a release (recommended)
 
-## Install (device: reMarkable Paper Pro)
+1. Grab `openrouter-chat-appload.tar.gz` from the
+   [Releases](../../releases) page (or the *Actions* tab → latest run →
+   *openrouter-chat-appload* artifact).
+2. Copy it to the device and unpack it into the AppLoad directory:
 
-1. Install [xovi](https://github.com/asivery/xovi) + [rm-appload](https://github.com/asivery/rm-appload) (free, one-time).
-2. Copy the app folder to `/home/root/xovi/exthome/appload/anki/`
-   (`ankimarkable`, `icon.png`, `external.manifest.json`).
-3. Copy `mathpng` to `/home/root/.ankimarkable/bin/mathpng` and the `microtex-res/`
-   folder to `/home/root/.ankimarkable/microtex-res/` (math support).
-4. Put your AnkiWeb credentials in `/home/root/.ankimarkable/ankiweb.txt`
-   (line 1: email, line 2: password), launch from the AppLoad menu, tap **Sync**.
+   ```sh
+   scp openrouter-chat-appload.tar.gz root@remarkable:/tmp/
+   ssh root@remarkable
+   mkdir -p /home/root/xovi/exthome/appload/openrouter-chat
+   tar -xzf /tmp/openrouter-chat-appload.tar.gz \
+       -C /home/root/xovi/exthome/appload/openrouter-chat --strip-components=1
+   chmod +x /home/root/xovi/exthome/appload/openrouter-chat/openrouter-chat
+   ```
 
-## Build (cross-compile from a Mac/Linux host)
+### Option B — build it yourself
+
+Host prerequisites: [rustup](https://rustup.rs), Zig 0.13, and
+`cargo-zigbuild`:
 
 ```sh
-export PROTOC="$(command -v protoc)"          # protobuf compiler for anki's build
-cargo zigbuild --target aarch64-unknown-linux-musl --release
+rustup target add aarch64-unknown-linux-musl
+cargo install cargo-zigbuild --locked
+./tools/build-appload.sh
 ```
 
-The math helper (`tools/mathpng/`) builds against
-[MicroTeX](https://github.com/NanoMichael/MicroTeX) with Qt6 in an aarch64 SDK
-container — see `tools/mathpng/mathpng-build.sh`.
+The script cross-compiles the static musl binary and assembles everything into
+`dist/openrouter-chat/`, packed as `dist/openrouter-chat-appload.tar.gz`.
+Copy that directory to the device exactly as in Option A, step 2.
 
-## Environment knobs
+Either way, the final device layout is:
 
-| Variable | Default | Meaning |
+```
+/home/root/xovi/exthome/appload/openrouter-chat/
+├── openrouter-chat            # the app (static aarch64 musl binary)
+├── external.manifest.json     # AppLoad manifest (name/application/qtfb)
+├── icon.png                   # launcher icon
+└── INSTALL.txt                # these steps, on the device
+```
+
+---
+
+## Add your OpenRouter API key
+
+Create a key at <https://openrouter.ai/keys>, then edit the manifest **on the
+device**:
+
+```sh
+ssh root@remarkable
+vi /home/root/xovi/exthome/appload/openrouter-chat/external.manifest.json
+```
+
+Add an `environment` block so AppLoad passes the key to the process:
+
+```json
+{
+  "name": "OpenRouter Chat",
+  "application": "openrouter-chat",
+  "qtfb": true,
+  "environment": {
+    "OPENROUTER_API_KEY": "sk-or-v1-your-key-here"
+  }
+}
+```
+
+Save, then launch **OpenRouter Chat** from the XOVI → AppLoad menu. The header
+shows how many models were loaded once the list arrives.
+
+Notes:
+
+- The key is read from the `OPENROUTER_API_KEY` environment variable at
+  startup — nothing is fetched or sent until you tap a Send button.
+- The key is stored as plain text on the device (anyone with root/SSH access
+  can read the manifest). Don't reuse a high-limit production key.
+- No key set? The app still opens and the header reads
+  "Set OPENROUTER_API_KEY then relaunch".
+- Running the binary by hand over SSH instead? Just export the variable first:
+  `OPENROUTER_API_KEY=sk-or-... ./openrouter-chat` (needs a `QTFB_KEY` from
+  AppLoad, so the menu is the normal route).
+
+---
+
+## Using the app
+
+| Control | What it does |
+|---|---|
+| Header ◀ ▶ | Previous / next model |
+| Header model name | Jump to a model at that position in the list |
+| Header EXIT | Quit |
+| Chat area, top half | Scroll transcript up |
+| Chat area, bottom half | Scroll transcript down |
+| Whiteboard pad | Write with the marker (flip the pen to erase) |
+| **Send Ink-to-Text** | The selected vision model transcribes the pad, then answers it |
+| **Send Image** | Sends the pad PNG inline as an `image_url` |
+| **Keyboard** | Toggles the on-screen QWERTY keyboard over the pad |
+| **Send Text** | Sends the typed prompt (keyboard mode) |
+
+Keyboard mode hides the pen pad; switch back with the same button to keep
+writing. Pen ink is preserved across mode switches.
+
+---
+
+## Continuous integration
+
+Every push to `main`, every pull request, and every `v*` tag builds the
+AppLoad bundle through [.github/workflows/build.yml](.github/workflows/build.yml),
+which runs `tools/build-appload.sh`:
+
+1. Cross-compiles `openrouter-chat` for `aarch64-unknown-linux-musl` with
+   `cargo zigbuild --release`.
+2. Verifies the binary and assembles the bundle (binary + manifest + icon +
+   `INSTALL.txt`).
+3. Uploads `openrouter-chat-appload.tar.gz` as a workflow artifact; tag builds
+   (`v*`) additionally attach it to a GitHub release.
+
+To cut a release:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+---
+
+## Environment variables
+
+| Variable | Required | Meaning |
 |---|---|---|
-| `ANKIMARKABLE_COL` | `/home/root/.ankimarkable/collection.anki2` | collection path |
-| `ANKIMARKABLE_DECK` | `uni` | initial deck scope |
-| `AM_MATHPNG` | `/home/root/.ankimarkable/bin/mathpng` | math helper binary |
-| `AM_MATHPNG_RES` | `/home/root/.ankimarkable/microtex-res` | MicroTeX res fonts |
-
-Remembered settings (colour/B&W mode, zoom step) live in
-`/home/root/.ankimarkable/prefs`, a two-line `key=value` file written atomically
-on every change; delete it to reset to colour at 1.0×.
+| `OPENROUTER_API_KEY` | yes | OpenRouter API key, read at startup |
+| `QTFB_KEY` | set by AppLoad | Framebuffer handle; don't set manually |
 
 ## License
 
-**AGPL-3.0** (see `LICENSE`) — required by the [Anki](https://github.com/ankitects/anki)
-`rslib` backend this links. Vendored `vendor/rex` is MIT/Apache-2.0;
-`tools/mathpng` builds against MIT-licensed MicroTeX; bundled fonts are OFL/MIT.
-
-A ready-made binary bundle is sold at
-[bazaar.abaj.ai/p/ankimarkable](https://bazaar.abaj.ai/p/ankimarkable) — buying it funds development;
-building from this source yourself is and will always be possible.
+**AGPL-3.0** (see `LICENSE`). Vendored `vendor/rex` is MIT/Apache-2.0; bundled
+fonts are OFL/MIT.

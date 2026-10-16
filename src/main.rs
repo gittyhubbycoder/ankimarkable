@@ -1,281 +1,275 @@
-//! ankimarkable — Anki review client for the reMarkable Paper Pro (AppLoad/QTFB).
-//!
-//! Review the `uni` deck on-device with Anki's real backend (rslib): true `.anki2`
-//! collection, real FSRS scheduler, AnkiWeb sync, full HTML/CSS card rendering,
-//! plus an AnkiDroid-style pen **whiteboard** over the card so you can write your
-//! answer before revealing. External AppLoad app — no xochitl injection, no
-//! bank-flip risk.
+//! OpenRouter Chat — standalone XOVI/AppLoad external process for reMarkable Paper Pro.
+//! QTFB, direct evdev pen sampling, the native low-latency whiteboard and the
+//! blitz/stylo display engine remain the UI/rendering foundation.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-
-use ankimarkable::backend::{self, Backend, Counts, DeckInfo, Stats, SyncReport};
-use ankimarkable::gesture::{CardGesture, CardTouch};
-use ankimarkable::orient::OrientTracker;
-use ankimarkable::pen::Pen;
-use ankimarkable::qtfb::{
-    Qtfb, INPUT_TOUCH_PRESS, INPUT_TOUCH_RELEASE, INPUT_TOUCH_UPDATE, REFRESH_MODE_CONTENT,
-};
-use ankimarkable::render::{CardView, Renderer, ZOOM_STEPS};
-use ankimarkable::ui::{self, Hit, HomeHit, MenuState, Phase};
-use ankimarkable::prefs::Prefs;
-use ankimarkable::whiteboard::Whiteboard;
+type NetResult<T> = std::result::Result<T, String>;
+use openrouter_chat::openrouter::{Message, Model, OpenRouter};
+use openrouter_chat::orient::OrientTracker;
+use openrouter_chat::pen::Pen;
+use openrouter_chat::qtfb::{Qtfb, INPUT_TOUCH_PRESS, INPUT_TOUCH_RELEASE, INPUT_TOUCH_UPDATE};
+use openrouter_chat::render::{CardView, Renderer};
+use openrouter_chat::ui::{self, ChatHit, ChatMessage};
+use openrouter_chat::whiteboard::Whiteboard;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
-
 extern "C" fn on_sigterm(_sig: i32) {
     RUNNING.store(false, Ordering::SeqCst);
 }
 
-const DATA_DIR: &str = "/home/root/.ankimarkable";
-
-/// Which screen is showing. The app opens to Home (deck list + streak); tapping a
-/// deck enters Review; the Home button returns.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Screen {
-    Home,
-    Review,
+#[derive(Debug)]
+enum NetCommand {
+    LoadModels,
+    Text {
+        model: String,
+        prompt: String,
+        history: Vec<Message>,
+    },
+    InkOcr {
+        model: String,
+        png: Vec<u8>,
+        history: Vec<Message>,
+    },
+    Image {
+        model: String,
+        prompt: String,
+        png: Vec<u8>,
+        history: Vec<Message>,
+    },
 }
-
-fn collection_path() -> String {
-    std::env::var("ANKIMARKABLE_COL").unwrap_or_else(|_| format!("{DATA_DIR}/collection.anki2"))
+#[derive(Debug)]
+enum NetEvent {
+    Models(NetResult<Vec<Model>>),
+    Reply {
+        user_text: String,
+        assistant: NetResult<String>,
+    },
+    InkReply {
+        transcript: String,
+        assistant: NetResult<String>,
+    },
 }
 
 fn main() {
-    // Graceful shutdown on swipe-from-top (AppLoad sends SIGTERM).
     unsafe {
-        let h = on_sigterm as extern "C" fn(i32) as libc::sighandler_t;
-        libc::signal(libc::SIGTERM, h);
-        libc::signal(libc::SIGINT, h);
+        let handler = on_sigterm as extern "C" fn(i32) as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
     }
-
     let qtfb = match Qtfb::connect_from_env() {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("ankimarkable: QTFB connect failed: {e}");
+        Ok(qtfb) => qtfb,
+        Err(error) => {
+            eprintln!("openrouter-chat: QTFB connect failed: {error}");
             std::process::exit(1);
         }
     };
-    if let Err(e) = run(qtfb) {
-        eprintln!("ankimarkable: {e:#}");
+    if let Err(error) = run(qtfb) {
+        eprintln!("openrouter-chat: {error:#}");
     }
 }
 
 fn run(mut qtfb: Qtfb) -> Result<()> {
-    let _ = std::fs::create_dir_all(DATA_DIR);
-    let col_path = collection_path();
-    // Card media lives in the sibling `<collection>.media` folder.
-    let media_dir = std::path::Path::new(&col_path).with_extension("media");
-    let renderer = Renderer::new().with_media_dir(media_dir);
-    let mut wb = Whiteboard::new();
-
-    // Read the streak BEFORE opening the collection — anki takes an exclusive lock
-    // on open, after which no other connection can read `revlog`.
-    let base_stats = backend::read_stats(&col_path);
-
-    let mut backend = match Backend::open(&col_path) {
-        Ok(b) => b,
-        Err(e) => {
-            ui::draw_message(
-                &mut qtfb,
-                &renderer,
-                "No collection",
-                &format!("{e}. Tap Exit, set up AnkiWeb creds, then Sync."),
-            );
-            wait_for_exit(&qtfb);
-            return Ok(());
-        }
-    };
-
-    // The pen ("Elan marker") is read directly from evdev; if it's unavailable the
-    // app still works finger-only (buttons via the QTFB touch socket).
-    let mut pen = match Pen::open() {
-        Ok(p) => {
-            eprintln!("ankimarkable: pen at {}", p.dev_path);
-            Some(p)
-        }
-        Err(e) => {
-            eprintln!("ankimarkable: no pen ({e}) — finger-only");
+    let renderer = Renderer::new();
+    let mut whiteboard = Whiteboard::new();
+    let api = match OpenRouter::from_env() {
+        Ok(api) => Some(api),
+        Err(error) => {
+            eprintln!("openrouter-chat: API key unavailable: {error:#}");
             None
         }
     };
-
-    // The host composites our buffer rotated when xochitl's scene is
-    // portrait-inverted (and pre-transforms the QTFB touch stream to match), but
-    // the raw-evdev marker bypasses that — so the pen frame must track the scene
-    // orientation or ink lands point-mirrored (see orient.rs).
-    let mut orient = OrientTracker::new();
-    if let Some(p) = pen.as_mut() {
-        p.set_flip180(orient.flip180());
+    let (command_tx, command_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+    if let Some(api) = api {
+        spawn_network_worker(api, command_rx, event_tx);
+        let _ = command_tx.send(NetCommand::LoadModels);
+    } else {
+        drop(command_rx);
+        drop(event_tx);
     }
-    eprintln!(
-        "ankimarkable: orientation {}",
-        if orient.flip180() { "portrait-inverted" } else { "portrait" }
-    );
 
-    // App opens on the Home screen: a collapsible deck tree + streak.
-    let mut screen = Screen::Home;
-    let mut all_decks: Vec<DeckInfo> = backend.deck_infos().unwrap_or_default();
-    // Runtime collapse state, keyed by deck id (empty = all expanded so subdecks
-    // are visible; the chevron toggles per deck).
-    let mut collapsed: HashSet<i64> = HashSet::new();
-    let mut scroll: usize = 0;
-    let mut visible = visible_decks(&all_decks, &collapsed);
-    // Reviews graded this session — added to the startup `reviewed_today` (the DB
-    // is locked now so we can't re-read it).
-    let mut session_reviews: u32 = 0;
-    // Palm rejection: touches within this window of the last pen sample are ignored.
-    let mut last_pen: Option<Instant> = None;
-    const PALM_WINDOW: Duration = Duration::from_millis(250);
-    // …and while the pen merely HOVERS, which is the state your hand lands in when
-    // you settle it on the panel to start writing. Bounded by pen recency so a
-    // missing "left proximity" report can't lock out finger input permanently
-    // (hovering emits a steady event stream, so a real hover keeps refreshing it).
-    let mut pen_hover = false;
-    const HOVER_WINDOW: Duration = Duration::from_millis(1500);
-    // Idle gap after which a colour settle fires — long enough that pauses BETWEEN
-    // words while handwriting a sentence don't each trigger a refresh (they collapse
-    // into one settle once you actually stop).
-    const SETTLE_IDLE: Duration = Duration::from_millis(1200);
-    // Timestamp of the last touch event we processed. This panel drops RELEASE
-    // (and pen-up) samples; a dropped gesture-end would otherwise latch
-    // `multi_active()`/`is_inking()` true forever and silently swallow every later
-    // tap (the "frozen app" failure mode). If the screen has been untouched for
-    // STALE_IDLE while such a state is latched, we force it closed below.
-    let mut last_touch: Option<Instant> = None;
-    const STALE_IDLE: Duration = Duration::from_millis(2000);
-    // The fastScratch scratchpad overlay draws on top of us and needs the marker.
-    // The QTFB protocol sends NO background/focus message to external apps —
-    // rm-appload forwards only MESSAGE_USERINPUT; the MESSAGE_SYSTEM_* traffic
-    // lives on a management socket external apps never join — so this state file
-    // is the ONLY foreground signal we get. While it reports open we release the
-    // pen's exclusive EVIOCGRAB (so the overlay can ink) and drop our own pen
-    // samples. Known limitation: a DIFFERENT AppLoad app foregrounded over us is
-    // undetectable — we'd keep the grab and fight it for the marker.
-    const SCRATCHPAD_STATE: &str = "/home/root/.scratchpad-state";
-    const SCRATCH_POLL: Duration = Duration::from_millis(300);
-    let mut pen_paused = false;
-    let mut last_scratch_check: Option<Instant> = None;
-
-    // Review state, populated when a deck is picked.
-    let mut counts = Counts::default();
-    let mut current: Option<backend::ReviewCard> = None;
-    let mut menu = MenuState::Closed; // ⋮ overflow menu (Flag… / Bury / Suspend)
-    // Persisted preferences: colour vs black-and-white rendering and the zoom
-    // step every card opens at. Loaded here, saved whenever either changes, so
-    // both survive the next card AND the next launch.
-    let prefs_path = std::path::PathBuf::from(format!("{DATA_DIR}/prefs"));
-    let mut prefs = Prefs::load(&prefs_path);
-    eprintln!(
-        "ankimarkable: prefs {} zoom={}x",
-        if prefs.mono { "black-and-white" } else { "colour" },
-        ZOOM_STEPS[prefs.zoom_idx]
-    );
-    // Live scrollable/zoomable card document (None until a card is shown).
+    let mut models: Vec<Model> = Vec::new();
+    let mut model_idx = 0usize;
+    let mut transcript: Vec<ChatMessage> = Vec::new();
+    let mut input = String::new();
+    let mut keyboard = false;
+    let mut busy = false;
+    let mut status = if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+        "Loading models…".to_string()
+    } else {
+        "Set OPENROUTER_API_KEY then relaunch".to_string()
+    };
     let mut view: Option<CardView> = None;
-    // Two-finger scroll/pinch recognition over the QTFB touch stream.
-    let mut touch = CardTouch::new();
-    let mut last_gesture: Option<Instant> = None;
-    let mut phase = Phase::Question;
-    let mut status = String::new();
+    let mut transcript_scroll = 0.0;
+    let mut last_pen: Option<Instant> = None;
+    let mut pen_hover = false;
+    let mut orient = OrientTracker::new();
+    let mut pen = match Pen::open() {
+        Ok(mut pen) => {
+            pen.set_flip180(orient.flip180());
+            Some(pen)
+        }
+        Err(error) => {
+            eprintln!("openrouter-chat: pen unavailable ({error}); touch-only controls");
+            None
+        }
+    };
+    let mut last_pen_event: Option<Instant> = None;
+    const PEN_SETTLE: Duration = Duration::from_millis(900);
+    const PALM_WINDOW: Duration = Duration::from_millis(250);
+    const HOVER_WINDOW: Duration = Duration::from_millis(1500);
 
-    ui::draw_home(
+    draw(
         &mut qtfb,
         &renderer,
-        &visible,
-        scroll,
-        home_stats(base_stats, session_reviews),
+        &mut whiteboard,
+        &mut view,
+        &transcript,
+        &models,
+        model_idx,
+        &status,
+        &input,
+        keyboard,
+        transcript_scroll,
     );
 
     'main: while RUNNING.load(Ordering::SeqCst) {
-        // Recover from a dropped terminal touch/pen event. This panel routinely
-        // drops the RELEASE that ends a two-finger gesture and the pen-up that ends
-        // a stroke; either leak latches `multi_active()`/`is_inking()` true, after
-        // which EVERY tap is swallowed (as a phantom gesture / as palm) and the app
-        // reads as frozen. There's no in-band signal that a held finger lifted, so
-        // we time it out: if the screen has been untouched for STALE_IDLE while such
-        // a state is latched, force the gesture tracker and any open stroke closed.
-        // (A real gesture completes well under STALE_IDLE, so this never clips one.)
-        if touch.multi_active() && last_touch.map_or(true, |t| t.elapsed() >= STALE_IDLE) {
-            touch = CardTouch::new();
-        }
-        if wb.is_inking() && last_pen.map_or(true, |t| t.elapsed() >= STALE_IDLE) {
-            wb.end_stroke();
-        }
-        // Poll the scratchpad state file (missing/unreadable = closed). On open we
-        // release the pen grab and close any stroke the overlay interrupted (a
-        // never-ending `active` stroke would latch palm rejection on). While
-        // closed, set_grab(true) runs EVERY check — a no-op when already grabbed,
-        // but it recovers a grab lost in a race with fastScratch's own retries.
-        if last_scratch_check.map_or(true, |t| t.elapsed() >= SCRATCH_POLL) {
-            last_scratch_check = Some(Instant::now());
-            let open = std::fs::read_to_string(SCRATCHPAD_STATE)
-                .map(|s| s.split_whitespace().collect::<String>().contains("\"open\":true"))
-                .unwrap_or(false);
-            if open != pen_paused {
-                pen_paused = open;
-                if open {
-                    wb.end_stroke();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                NetEvent::Models(Ok(found)) => {
+                    models = found;
+                    if !models.is_empty() {
+                        model_idx = initial_model(&models);
+                        status = format!("{} models", models.len());
+                    } else {
+                        status = "No models returned".into();
+                    }
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        transcript_scroll,
+                    );
                 }
-                eprintln!(
-                    "ankimarkable: scratchpad {} — pen {}",
-                    if open { "open" } else { "closed" },
-                    if open { "released" } else { "re-grabbed" }
-                );
-            }
-            if let Some(p) = pen.as_mut() {
-                p.set_grab(!open);
+                NetEvent::Models(Err(error)) => {
+                    status = format!("Model list: {error}");
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        transcript_scroll,
+                    );
+                }
+                NetEvent::Reply {
+                    user_text,
+                    assistant,
+                } => {
+                    busy = false;
+                    transcript.push(ChatMessage {
+                        role: "user".into(),
+                        content: user_text,
+                    });
+                    match assistant {
+                        Ok(text) => {
+                            transcript.push(ChatMessage {
+                                role: "assistant".into(),
+                                content: text,
+                            });
+                            status = "Ready".into();
+                            if keyboard {
+                                input.clear();
+                            } else {
+                                whiteboard.clear_ink();
+                            }
+                        }
+                        Err(error) => status = format!("Request failed: {error}"),
+                    }
+                    view = None;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        0.0,
+                    );
+                }
+                NetEvent::InkReply {
+                    transcript: recognized,
+                    assistant,
+                } => {
+                    busy = false;
+                    match assistant {
+                        Ok(text) => {
+                            transcript.push(ChatMessage {
+                                role: "user".into(),
+                                content: format!("(ink OCR) {recognized}"),
+                            });
+                            transcript.push(ChatMessage {
+                                role: "assistant".into(),
+                                content: text,
+                            });
+                            status = "Ink sent".into();
+                            whiteboard.clear_ink();
+                        }
+                        Err(error) => status = format!("Ink request failed: {error}"),
+                    }
+                    view = None;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        0.0,
+                    );
+                }
             }
         }
-        // Track the scene orientation (rate-limited internally). A confirmed
-        // flip re-frames the pen; any stroke supposedly in flight is stale (the
-        // tablet was just physically rotated), so close it rather than let its
-        // tail tear across the mirrored frame.
+
         if let Some(flip) = orient.poll() {
             if let Some(p) = pen.as_mut() {
                 p.set_flip180(flip);
             }
-            wb.end_stroke();
-            eprintln!(
-                "ankimarkable: orientation → {}",
-                if flip { "portrait-inverted" } else { "portrait" }
-            );
+            whiteboard.end_stroke();
         }
-        // Flush any pending ink FIRST (non-blocking; keeps the dirty region if the
-        // e-ink server is still busy). Retrying at the loop top means a deferred
-        // update lands promptly without ever blocking the loop. Once writing has
-        // clearly PAUSED (SETTLE_IDLE since the last pen sample — long enough that
-        // mid-sentence word-pauses don't each trigger one), do ONE colour (GC16)
-        // clean of just the inked REGION: the fast DU waveform used while writing is
-        // grayscale + leaves "white rectangle" artifacts on the colour panel; the
-        // region clean restores colour + wipes them with only a small localized
-        // flash (never a whole-screen refresh). The debounce collapses the many
-        // pauses in a sentence into a single settle.
-        if screen == Screen::Review {
-            wb.flush_ink(&mut qtfb);
-            let pen_quiet = last_pen.map_or(true, |t| t.elapsed() >= SETTLE_IDLE);
-            let gesture_quiet =
-                last_gesture.map_or(true, |t| t.elapsed() >= Duration::from_millis(500));
-            if wb.needs_settle() && pen_quiet && gesture_quiet && !touch.multi_active() {
-                // The settle is a GC16 pass whose ONLY job is to restore colour and
-                // wipe fast-waveform artifacts on the colour panel. In black-and-white
-                // mode there's no colour to restore, so it would be a pointless flash
-                // after every writing pause — drop it (also clears needs_settle() so
-                // the loop returns to its idle poll cadence).
-                if prefs.mono {
-                    wb.discard_settle();
-                } else {
-                    wb.settle_color(&mut qtfb);
-                }
-            }
+        if whiteboard.has_pending_ink() {
+            whiteboard.flush_ink(&mut qtfb);
         }
-        let reviewing = screen == Screen::Review;
+        if whiteboard.needs_settle() && last_pen_event.map_or(true, |t| t.elapsed() >= PEN_SETTLE) {
+            whiteboard.settle_color(&mut qtfb);
+        }
 
-        // Poll the QTFB touch socket and (if present) the pen evdev fd together.
-        let mut fds: Vec<libc::pollfd> = Vec::with_capacity(2);
+        let mut fds = Vec::with_capacity(2);
         fds.push(libc::pollfd {
             fd: qtfb.raw_fd(),
             events: libc::POLLIN,
@@ -288,648 +282,509 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                 revents: 0,
             });
         }
-        // Short timeout while ink is pending so a deferred flush retries within ~30ms;
-        // a medium one while a colour settle is due so it fires shortly after a pause.
-        let timeout = if reviewing && wb.has_pending_ink() {
+        let timeout = if whiteboard.has_pending_ink() {
             30
-        } else if reviewing && wb.needs_settle() {
+        } else if busy {
             120
         } else {
-            1000
+            700
         };
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if rc <= 0 {
-            // EINTR (SIGTERM) or timeout — loop back; the top-of-loop flush retries.
             continue;
         }
-
-        // Pen: drain ALL samples and ink them (the refresh is flushed at the loop
-        // top, coalesced and non-blocking — never per-sample, never blocking).
         if fds.len() == 2 && fds[1].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
-            if pen_paused {
-                // The scratchpad overlay owns the pen: still drain the fd (it keeps
-                // reporting to us even ungrabbed) but drop the samples and skip the
-                // last_pen/pen_hover stamping — a released pen must not trigger
-                // palm rejection against the overlay's own writing.
-                let p = pen.as_mut().unwrap();
-                let r = p.drain(|_| {});
-                let _ = p.take_activity();
-                if r.is_err() {
-                    eprintln!("ankimarkable: pen read error — dropping pen");
-                    pen = None;
-                }
-            } else {
-                let mut inked = false;
-                let mut stroke_started = false;
-                // The PEN WINS over touch. Gating ink on `!touch.multi_active()` meant a
-                // resting palm — which reports as ≥2 card contacts — silently swallowed
-                // every sample for as long as the hand stayed down, i.e. writing simply
-                // didn't work. A palm can't be told from fingers by position, but the
-                // marker is separate hardware: if it's reporting, the hand on the glass
-                // is a palm, so ink unconditionally and cancel the phantom gesture below.
-                let r = pen.as_mut().unwrap().drain(|s| {
-                    inked = true;
-                    if reviewing {
-                        stroke_started |= s.down;
-                        wb.ink_sample(s, &mut qtfb);
-                    }
-                });
-                let p = pen.as_mut().unwrap();
-                pen_hover = p.in_proximity();
-                let pen_events = p.take_activity();
-                if stroke_started {
-                    // Drop whatever the palm registered before the tip landed, so it can
-                    // neither latch `multi_active()` nor fire a scroll/pinch mid-stroke.
-                    touch = CardTouch::new();
-                }
-                // Stamp on ANY marker traffic, hover included — the palm-rejection window
-                // must already be open when the hand lands ahead of the first ink sample.
-                if inked || pen_events {
-                    last_pen = Some(Instant::now());
-                }
-                if inked && reviewing {
-                    // Ship the freshly-inked pixels NOW (same iteration) rather than
-                    // waiting for the next poll cycle — one less cycle of ink latency.
-                    wb.flush_ink(&mut qtfb);
-                }
-                if r.is_err() {
-                    eprintln!("ankimarkable: pen read error — dropping pen");
-                    pen = None;
-                }
+            let mut inked = false;
+            let result = pen.as_mut().unwrap().drain(|sample| {
+                inked = true;
+                whiteboard.ink_sample(sample, &mut qtfb);
+            });
+            let p = pen.as_mut().unwrap();
+            pen_hover = p.in_proximity();
+            let activity = p.take_activity();
+            if inked || activity {
+                last_pen = Some(Instant::now());
+                last_pen_event = Some(Instant::now());
+            }
+            if inked {
+                whiteboard.flush_ink(&mut qtfb);
+            }
+            if result.is_err() {
+                pen = None;
             }
         }
-
         if fds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) == 0 {
             continue;
         }
-        // Drain EVERY queued touch event this wake (motion arrives as repeated
-        // PRESS with the same dev_id on this panel — one-event-per-poll would lag).
-        'input: loop {
+        'drain: loop {
             let ev = match qtfb.recv_input_nonblock() {
                 Ok(Some(ev)) => ev,
-                Ok(None) => break 'input,
-                Err(_) => break 'main, // socket closed
+                Ok(None) => break 'drain,
+                Err(_) => break 'main,
             };
-            let ty = ev.input_type;
-            let is_touch = ty == INPUT_TOUCH_PRESS
-                || ty == INPUT_TOUCH_RELEASE
-                || ty == INPUT_TOUCH_UPDATE;
-            if !is_touch {
-                continue 'input;
+            if !matches!(
+                ev.input_type,
+                INPUT_TOUCH_PRESS | INPUT_TOUCH_RELEASE | INPUT_TOUCH_UPDATE
+            ) {
+                continue;
             }
-            // Palm rejection: ignore finger/palm touches while a stroke is in
-            // progress, within PALM_WINDOW of the last pen sample, and while the pen
-            // hovers (the hand settles on the panel BEFORE the tip lands, so without
-            // the hover arm the palm gets a head start and registers as a gesture).
-            let pen_recent = last_pen.map_or(false, |t| t.elapsed() < PALM_WINDOW);
-            let hovering = pen_hover && last_pen.map_or(false, |t| t.elapsed() < HOVER_WINDOW);
-            if reviewing && (pen_recent || hovering || wb.is_inking()) {
-                // A swallowed RELEASE must still retire its contact — otherwise the
-                // palm stays "down" in the tracker and latches multi_active() on.
-                if ty == INPUT_TOUCH_RELEASE {
-                    touch.forget(ev.dev_id);
-                }
-                continue 'input;
+            if ev.input_type != INPUT_TOUCH_PRESS {
+                continue;
             }
-            // Stamp only touches we actually act on: the stale-gesture recovery at the
-            // loop top must be able to fire while a rejected palm keeps streaming.
-            last_touch = Some(Instant::now());
-
-            // ── Review-screen gesture routing (menu-open taps skip to hit_menu) ──
-            if reviewing && menu == MenuState::Closed {
-                let in_card = ui::in_card_region(ev.x, ev.y);
-                if in_card || touch.is_tracked(ev.dev_id) || touch.multi_active() {
-                    let fed = touch.feed(ty, ev.dev_id, ev.x, ev.y, in_card);
-                    match fed.gesture {
-                        CardGesture::ScrollStep(dy) => {
-                            if let Some(v) = view.as_mut() {
-                                if v.scroll_by(dy as f64) {
-                                    let mut window = v.paint_window();
-                                    ui::draw_scroll_indicator(
-                                        &mut window,
-                                        v.scroll_phys(),
-                                        v.max_scroll(),
-                                        v.content_h(),
-                                    );
-                                    ui::patch_card_band(
-                                        wb.base_mut(),
-                                        &window,
-                                        &renderer,
-                                        menu,
-                                        current.as_ref().map_or(0, |c| c.flags),
-                                        prefs.mono,
-                                    );
-                                    wb.set_view(v.scroll_css() as f32, v.zoom() as f32);
-                                    wb.blit_band_fast(&mut qtfb);
-                                    last_gesture = Some(Instant::now());
-                                }
-                            }
-                        }
-                        CardGesture::PinchEnd { ratio } => {
-                            let dir = if ratio >= 1.15 {
-                                1
-                            } else if ratio <= 0.87 {
-                                -1
+            // Marker traffic wins over palms, but touch remains usable on the header
+            // and footer: only the whiteboard/transcript middle is pen-protected.
+            let pen_active = last_pen.map_or(false, |t| t.elapsed() < PALM_WINDOW)
+                || (pen_hover && last_pen.map_or(false, |t| t.elapsed() < HOVER_WINDOW))
+                || whiteboard.is_inking();
+            if pen_active && (ev.y as usize) >= ui::INK_Y && (ev.y as usize) < ui::FOOTER_Y {
+                continue;
+            }
+            match ui::hit_test(ev.x, ev.y, keyboard) {
+                ChatHit::Exit => break 'main,
+                ChatHit::ModelPrevious | ChatHit::ModelNext => {
+                    if !models.is_empty() {
+                        model_idx =
+                            if matches!(ui::hit_test(ev.x, ev.y, keyboard), ChatHit::ModelPrevious)
+                            {
+                                (model_idx + models.len() - 1) % models.len()
                             } else {
-                                0
+                                (model_idx + 1) % models.len()
                             };
-                            if dir != 0 {
-                                if let Some(v) = view.as_mut() {
-                                    if v.set_zoom_step(dir) {
-                                        // The level you pinched to is the new
-                                        // default for every later card.
-                                        prefs.zoom_idx = v.zoom_idx();
-                                        prefs.save_or_warn(&prefs_path);
-                                        // Re-anchor the ink to the new scroll/zoom
-                                        // BEFORE the band blit so it ships one frame.
-                                        wb.set_view(v.scroll_css() as f32, v.zoom() as f32);
-                                        let mut window = v.paint_window();
-                                        ui::draw_scroll_indicator(
-                                            &mut window,
-                                            v.scroll_phys(),
-                                            v.max_scroll(),
-                                            v.content_h(),
-                                        );
-                                        ui::patch_card_band(
-                                            wb.base_mut(),
-                                            &window,
-                                            &renderer,
-                                            menu,
-                                            current.as_ref().map_or(0, |c| c.flags),
-                                            prefs.mono,
-                                        );
-                                        // Fast feedback now; the queued colour settle
-                                        // makes it crisp ~500ms after the gesture.
-                                        wb.blit_band_fast(&mut qtfb);
-                                        last_gesture = Some(Instant::now());
-                                    }
-                                }
-                            }
-                        }
-                        CardGesture::None => {}
                     }
-                    if touch.multi_active() {
-                        last_gesture = Some(Instant::now());
+                    status = "Model selected".into();
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::ModelSelect(x) => {
+                    if !models.is_empty() {
+                        let picker = x.saturating_sub(362);
+                        let width = ui::WIDTH.saturating_sub(362 + 224).max(1);
+                        model_idx = (picker * models.len() / width).min(models.len() - 1);
+                        status = format!("{} selected", models[model_idx].name);
                     }
-                    continue 'input; // card-region touches NEVER hit-test (palm safety)
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        transcript_scroll,
+                    );
                 }
-                // Chrome buttons: feed for dev_id dedup; act once per physical press
-                // (motion re-PRESSes of a held finger must not re-fire buttons).
-                let fed = touch.feed(ty, ev.dev_id, ev.x, ev.y, false);
-                if ty != INPUT_TOUCH_PRESS || !fed.new_contact {
-                    continue 'input;
-                }
-            } else if ty != INPUT_TOUCH_PRESS {
-                // Home screen + open-menu handling act on plain presses only.
-                continue 'input;
-            }
-
-            match screen {
-            Screen::Home => match ui::hit_test_home(ev.x, ev.y, &visible, scroll) {
-                HomeHit::Deck(i) => {
-                    if let Some(d) = visible.get(i) {
-                        let _ = backend.set_deck_scope_id(d.id);
-                        counts = backend.counts().unwrap_or_default();
-                        current = backend.next_card().unwrap_or(None);
-                        phase = Phase::Question;
-                        status = d.name.clone();
-                        wb.clear_ink();
-                        invalidate_view(&mut view, &mut wb);
-                        screen = Screen::Review;
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu, &prefs);
+                ChatHit::ScrollTranscript => {
+                    if let Some(v) = view.as_mut() {
+                        let dy = if ev.y < (ui::CARD_Y + ui::CARD_H / 2) as i32 {
+                            -300.0
+                        } else {
+                            300.0
+                        };
+                        v.scroll_by(dy);
+                        transcript_scroll = v.scroll_phys();
+                        let window = v.paint_window();
+                        ui::patch_transcript_band(whiteboard.base_mut(), &window);
+                        whiteboard.blit_transcript_fast(&mut qtfb);
                     }
                 }
-                HomeHit::Toggle(i) => {
-                    if let Some(d) = visible.get(i) {
-                        let id = d.id.0;
-                        if !collapsed.remove(&id) {
-                            collapsed.insert(id);
-                        }
-                        visible = visible_decks(&all_decks, &collapsed);
-                        clamp_scroll(&mut scroll, visible.len());
-                        ui::draw_home(
+                ChatHit::ToggleKeyboard => {
+                    keyboard = !keyboard;
+                    whiteboard.set_ink_visible(!keyboard);
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::SendInkOcr => {
+                    if !busy && !whiteboard.ink_present() {
+                        status = "Write something on the pad first".into();
+                        redraw(
                             &mut qtfb,
                             &renderer,
-                            &visible,
-                            scroll,
-                            home_stats(base_stats, session_reviews),
+                            &mut whiteboard,
+                            &mut view,
+                            &transcript,
+                            &models,
+                            model_idx,
+                            &status,
+                            &input,
+                            keyboard,
+                            transcript_scroll,
+                        );
+                        continue;
+                    }
+                    if !busy {
+                        match png_from_ink(&whiteboard) {
+                            Ok(png) => dispatch(
+                                &command_tx,
+                                &models,
+                                model_idx,
+                                NetCommand::InkOcr {
+                                    model: selected_id(&models, model_idx),
+                                    png,
+                                    history: history(&transcript),
+                                },
+                                &mut busy,
+                                &mut status,
+                            ),
+                            Err(error) => status = format!("{error:#}"),
+                        }
+                    }
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::SendImage => {
+                    if !busy && !whiteboard.ink_present() {
+                        status = "Write something on the pad first".into();
+                        redraw(
+                            &mut qtfb,
+                            &renderer,
+                            &mut whiteboard,
+                            &mut view,
+                            &transcript,
+                            &models,
+                            model_idx,
+                            &status,
+                            &input,
+                            keyboard,
+                            transcript_scroll,
+                        );
+                        continue;
+                    }
+                    if !busy {
+                        match png_from_ink(&whiteboard) {
+                            Ok(png) => dispatch(
+                                &command_tx,
+                                &models,
+                                model_idx,
+                                NetCommand::Image {
+                                    model: selected_id(&models, model_idx),
+                                    prompt: "Please analyze my handwritten note/image and respond."
+                                        .into(),
+                                    png,
+                                    history: history(&transcript),
+                                },
+                                &mut busy,
+                                &mut status,
+                            ),
+                            Err(error) => status = format!("{error:#}"),
+                        }
+                    }
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::SendText => {
+                    if !busy && !input.trim().is_empty() {
+                        let prompt = std::mem::take(&mut input);
+                        dispatch(
+                            &command_tx,
+                            &models,
+                            model_idx,
+                            NetCommand::Text {
+                                model: selected_id(&models, model_idx),
+                                prompt,
+                                history: history(&transcript),
+                            },
+                            &mut busy,
+                            &mut status,
                         );
                     }
-                }
-                HomeHit::ScrollUp => {
-                    let step = ui::home_page_rows().saturating_sub(1).max(1);
-                    scroll = scroll.saturating_sub(step);
-                    ui::draw_home(
+                    redraw(
                         &mut qtfb,
                         &renderer,
-                        &visible,
-                        scroll,
-                        home_stats(base_stats, session_reviews),
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        transcript_scroll,
                     );
                 }
-                HomeHit::ScrollDown => {
-                    let step = ui::home_page_rows().saturating_sub(1).max(1);
-                    let max_scroll = visible.len().saturating_sub(ui::home_page_rows());
-                    scroll = (scroll + step).min(max_scroll);
-                    ui::draw_home(
-                        &mut qtfb,
-                        &renderer,
-                        &visible,
-                        scroll,
-                        home_stats(base_stats, session_reviews),
-                    );
-                }
-                HomeHit::Sync => {
-                    ui::draw_message(
-                        &mut qtfb,
-                        &renderer,
-                        "Syncing…",
-                        "Contacting AnkiWeb — this can take a moment.",
-                    );
-                    let report = do_sync(&mut backend);
-                    let body = sync_report_body(&report);
-                    eprintln!(
-                        "ankimarkable: sync from home: {} | {}",
-                        report.headline,
-                        body.replace('\n', " | ")
-                    );
-                    // Hold the report on screen until acknowledged — the counts
-                    // are the only feedback that the sync actually moved cards.
-                    let msg = if body.is_empty() {
-                        "Tap anywhere to continue.".to_string()
-                    } else {
-                        format!("{body}\n\nTap anywhere to continue.")
-                    };
-                    ui::draw_message(&mut qtfb, &renderer, &report.headline, &msg);
-                    wait_for_tap(&mut qtfb);
-                    all_decks = backend.deck_infos().unwrap_or_default();
-                    visible = visible_decks(&all_decks, &collapsed);
-                    clamp_scroll(&mut scroll, visible.len());
-                    ui::draw_home(
-                        &mut qtfb,
-                        &renderer,
-                        &visible,
-                        scroll,
-                        home_stats(base_stats, session_reviews),
-                    );
-                }
-                HomeHit::Exit => break 'main,
-                HomeHit::None => {}
-            },
-            // While the ⋮ menu is open, taps hit its items (or dismiss it).
-            Screen::Review if menu != MenuState::Closed => {
-                let act = ui::hit_menu(ev.x, ev.y, menu);
-                let mut advanced = false;
-                match act {
-                    // Switch to the Flags submenu — the panel STAYS open.
-                    ui::MenuHit::OpenFlags => menu = MenuState::Flags,
-                    ui::MenuHit::Flag(n) => {
-                        // Deliberately NON-advancing: you flag a card and keep
-                        // reviewing it. Op::SetFlag is undoable, so the Undo
-                        // button undoes a flag before a grade — matches Anki.
-                        if let Some(card) = current.as_mut() {
-                            match backend.set_flag(card.card_id, n) {
-                                Ok(()) => card.flags = n as u8,
-                                Err(e) => status = format!("flag error: {e}"),
-                            }
+                ChatHit::Key(token) => {
+                    match token {
+                        "Backspace" => {
+                            input.pop();
                         }
-                        menu = MenuState::Closed;
-                    }
-                    ui::MenuHit::Bury => {
-                        if let Some(card) = &current {
-                            if let Err(e) = backend.bury_card(card.card_id) {
-                                status = format!("bury error: {e}");
-                            }
-                        }
-                        advanced = true;
-                        menu = MenuState::Closed;
-                    }
-                    ui::MenuHit::Suspend => {
-                        if let Some(card) = &current {
-                            if let Err(e) = backend.suspend_note(card.note_id) {
-                                status = format!("suspend error: {e}");
-                            }
-                        }
-                        advanced = true;
-                        menu = MenuState::Closed;
-                    }
-                    // Tapped outside → just dismiss.
-                    ui::MenuHit::None => menu = MenuState::Closed,
-                }
-                if advanced {
-                    counts = backend.counts().unwrap_or_default();
-                    current = backend.next_card().unwrap_or(None);
-                    phase = Phase::Question;
-                    wb.clear_ink();
-                    invalidate_view(&mut view, &mut wb);
-                }
-                redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu, &prefs);
-            }
-            Screen::Review => match ui::hit_test(ev.x, ev.y, phase) {
-                Hit::Exit => break 'main,
-                Hit::Home => {
-                    // Back to the deck list; rebuild deck counts (streak is cached).
-                    invalidate_view(&mut view, &mut wb);
-                    touch = CardTouch::new();
-                    screen = Screen::Home;
-                    all_decks = backend.deck_infos().unwrap_or_default();
-                    visible = visible_decks(&all_decks, &collapsed);
-                    clamp_scroll(&mut scroll, visible.len());
-                    wb.clear_ink();
-                    ui::draw_home(
-                        &mut qtfb,
-                        &renderer,
-                        &visible,
-                        scroll,
-                        home_stats(base_stats, session_reviews),
-                    );
-                }
-                Hit::Sync => {
-                    ui::draw_message(
-                        &mut qtfb,
-                        &renderer,
-                        "Syncing…",
-                        "Contacting AnkiWeb — this can take a moment.",
-                    );
-                    let report = do_sync(&mut backend);
-                    let body = sync_report_body(&report);
-                    eprintln!(
-                        "ankimarkable: sync from review: {} | {}",
-                        report.headline,
-                        body.replace('\n', " | ")
-                    );
-                    let msg = if body.is_empty() {
-                        "Tap anywhere to continue.".to_string()
-                    } else {
-                        format!("{body}\n\nTap anywhere to continue.")
-                    };
-                    ui::draw_message(&mut qtfb, &renderer, &report.headline, &msg);
-                    wait_for_tap(&mut qtfb);
-                    status = report.headline;
-                    counts = backend.counts().unwrap_or_default();
-                    current = backend.next_card().unwrap_or(None);
-                    phase = Phase::Question;
-                    wb.clear_ink();
-                    invalidate_view(&mut view, &mut wb);
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu, &prefs);
-                }
-                Hit::ShowAnswer => {
-                    if current.is_some() && phase == Phase::Question {
-                        phase = Phase::Answer;
-                        invalidate_view(&mut view, &mut wb);
-                        // Keep ink so you can compare your answer against the card.
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu, &prefs);
-                    }
-                }
-                Hit::Grade(g) => {
-                    if phase == Phase::Answer {
-                        if let Some(card) = &current {
-                            match backend.answer(card, g) {
-                                Ok(()) => session_reviews += 1,
-                                Err(e) => status = format!("answer error: {e}"),
-                            }
-                        }
-                        counts = backend.counts().unwrap_or_default();
-                        current = backend.next_card().unwrap_or(None);
-                        phase = Phase::Question;
-                        wb.clear_ink(); // next card starts on a clean whiteboard
-                        invalidate_view(&mut view, &mut wb);
-                        redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu, &prefs);
-                    }
-                }
-                Hit::Undo => {
-                    // Undo the last pen stroke; when the whiteboard is empty, fall
-                    // through to undoing the last graded card (Anki collection undo).
-                    if !wb.undo(&mut qtfb) {
-                        match backend.undo() {
-                            Ok(true) => {
-                                session_reviews = session_reviews.saturating_sub(1);
-                                counts = backend.counts().unwrap_or_default();
-                                current = backend.next_card().unwrap_or(None);
-                                phase = Phase::Question;
-                                wb.clear_ink();
-                                invalidate_view(&mut view, &mut wb);
-                                redraw(
-                                    &mut qtfb, &renderer, &mut wb, &current, &mut view, phase,
-                                    counts, &status, menu, &prefs,
+                        "Enter" => {
+                            if !busy && !input.trim().is_empty() {
+                                let prompt = std::mem::take(&mut input);
+                                dispatch(
+                                    &command_tx,
+                                    &models,
+                                    model_idx,
+                                    NetCommand::Text {
+                                        model: selected_id(&models, model_idx),
+                                        prompt,
+                                        history: history(&transcript),
+                                    },
+                                    &mut busy,
+                                    &mut status,
                                 );
                             }
-                            _ => {} // nothing to undo
                         }
+                        t => input.push_str(t),
                     }
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &status,
+                        &input,
+                        keyboard,
+                        transcript_scroll,
+                    );
                 }
-                Hit::Clear => wb.clear(&mut qtfb),
-                Hit::EraserToggle => {
-                    wb.toggle_eraser();
-                    // Recompose so the toolbar reflects the toggle; ink is kept.
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu, &prefs);
-                }
-                Hit::Menu => {
-                    // Open the ⋮ overflow menu (Flag… / Bury card / Suspend note).
-                    menu = MenuState::Root;
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu, &prefs);
-                }
-                Hit::ColorToggle => {
-                    // Tap the counts (top-left) to flip colour / black-and-white.
-                    prefs.mono = !prefs.mono;
-                    prefs.save_or_warn(&prefs_path);
-                    redraw(&mut qtfb, &renderer, &mut wb, &current, &mut view, phase, counts, &status, menu, &prefs);
-                }
-                Hit::None => {}
-            },
+                ChatHit::None => {}
             }
-        } // 'input drain
+        }
     }
-
-    // Drop(Qtfb) sends MESSAGE_TERMINATE.
     Ok(())
 }
 
-/// Compose the current screen into the whiteboard's base frame and push it (base +
-/// any ink) to the panel with a clean full refresh.
-///
-/// `view` is the live scrollable/zoomable card document — built here on demand
-/// (when a card/phase change invalidated it to `None`) and painted at its current
-/// scroll/zoom. Callers that change WHICH html is shown must set `*view = None`
-/// (see `invalidate_view`) so the document rebuilds.
+fn spawn_network_worker(api: OpenRouter, commands: Receiver<NetCommand>, events: Sender<NetEvent>) {
+    thread::Builder::new()
+        .name("openrouter-network".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = events.send(NetEvent::Models(Err(e.to_string())));
+                    return;
+                }
+            };
+            while let Ok(command) = commands.recv() {
+                match command {
+                    NetCommand::LoadModels => {
+                        let result = runtime.block_on(api.models()).map_err(|e| format!("{e:#}"));
+                        let _ = events.send(NetEvent::Models(result));
+                    }
+                    NetCommand::Text {
+                        model,
+                        prompt,
+                        history,
+                    } => {
+                        let mut messages = history;
+                        messages.push(Message {
+                            role: "user".into(),
+                            content: prompt.clone(),
+                        });
+                        let assistant = runtime
+                            .block_on(api.complete(&model, &messages))
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = events.send(NetEvent::Reply {
+                            user_text: prompt,
+                            assistant,
+                        });
+                    }
+                    NetCommand::InkOcr {
+                        model,
+                        png,
+                        history,
+                    } => {
+                        let result = runtime
+                            .block_on(api.ink_to_text(&model, &history, &png))
+                            .map_err(|e| format!("{e:#}"));
+                        match result {
+                            Ok((transcript, text)) => {
+                                let _ = events.send(NetEvent::InkReply {
+                                    transcript,
+                                    assistant: Ok(text),
+                                });
+                            }
+                            Err(error) => {
+                                let _ = events.send(NetEvent::InkReply {
+                                    transcript: "".into(),
+                                    assistant: Err(error),
+                                });
+                            }
+                        }
+                    }
+                    NetCommand::Image {
+                        model,
+                        prompt,
+                        png,
+                        history,
+                    } => {
+                        let assistant = runtime
+                            .block_on(api.send_image(&model, &history, &prompt, &png))
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = events.send(NetEvent::Reply {
+                            user_text: format!("{prompt} [handwritten image attached]"),
+                            assistant,
+                        });
+                    }
+                }
+            }
+        })
+        .expect("spawn network worker");
+}
+
+fn selected_id(models: &[Model], idx: usize) -> String {
+    models
+        .get(idx)
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| "openai/gpt-4o-mini".into())
+}
+fn initial_model(models: &[Model]) -> usize {
+    models
+        .iter()
+        .position(|m| m.id.contains("gpt-4o-mini"))
+        .unwrap_or(0)
+}
+fn history(messages: &[ChatMessage]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|m| Message {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect()
+}
+fn dispatch(
+    tx: &Sender<NetCommand>,
+    models: &[Model],
+    idx: usize,
+    command: NetCommand,
+    busy: &mut bool,
+    status: &mut String,
+) {
+    if models.is_empty() {
+        *status = "Waiting for model list".into();
+        return;
+    }
+    let model_name = models
+        .get(idx)
+        .map(|model| model.name.as_str())
+        .unwrap_or("selected model");
+    match tx.send(command) {
+        Ok(()) => {
+            *busy = true;
+            *status = format!("Sending to {model_name}…");
+        }
+        Err(error) => *status = format!("Network worker unavailable: {error}"),
+    }
+}
+
+fn draw(
+    qtfb: &mut Qtfb,
+    renderer: &Renderer,
+    wb: &mut Whiteboard,
+    view: &mut Option<CardView>,
+    messages: &[ChatMessage],
+    models: &[Model],
+    model_idx: usize,
+    status: &str,
+    input: &str,
+    keyboard: bool,
+    scroll: f64,
+) {
+    let html = ui::transcript_html(messages);
+    let mut v = renderer.build_card_view(&html, ui::WIDTH as u32, ui::CARD_H as u32);
+    if scroll > 0.0 {
+        v.scroll_by(scroll);
+    }
+    *view = Some(v);
+    redraw(
+        qtfb, renderer, wb, view, messages, models, model_idx, status, input, keyboard, scroll,
+    );
+}
+
 fn redraw(
     qtfb: &mut Qtfb,
     renderer: &Renderer,
     wb: &mut Whiteboard,
-    current: &Option<backend::ReviewCard>,
     view: &mut Option<CardView>,
-    phase: Phase,
-    counts: Counts,
+    messages: &[ChatMessage],
+    models: &[Model],
+    model_idx: usize,
     status: &str,
-    menu: MenuState,
-    prefs: &Prefs,
+    input: &str,
+    keyboard: bool,
+    scroll: f64,
 ) {
-    let eraser = wb.eraser;
-    let mono = prefs.mono;
-    let frame = match current {
-        Some(card) => {
-            let html = match phase {
-                Phase::Question => &card.question_html,
-                Phase::Answer => &card.answer_html,
-            };
-            if view.is_none() {
-                // Lay the card out at the persisted zoom step, and re-anchor the
-                // whiteboard to it so ink that survives a phase flip (question →
-                // answer) replays at the same scale the card is drawn at.
-                let v = renderer.build_card_view_at(
-                    html,
-                    ui::WIDTH as u32,
-                    ui::CARD_H as u32,
-                    prefs.zoom_idx,
-                );
-                wb.set_view(v.scroll_css() as f32, v.zoom() as f32);
-                *view = Some(v);
-            }
-            let v = view.as_ref().unwrap();
-            let mut window = v.paint_window();
-            ui::draw_scroll_indicator(&mut window, v.scroll_phys(), v.max_scroll(), v.content_h());
-            ui::compose_review(
-                renderer, &window, card, phase, counts, status, eraser, menu, mono,
-            )
+    if view.is_none() {
+        let html = ui::transcript_html(messages);
+        *view = Some(renderer.build_card_view(&html, ui::WIDTH as u32, ui::CARD_H as u32));
+        if scroll > 0.0 {
+            view.as_mut().unwrap().scroll_by(scroll);
         }
-        // Keep the top menu bar so Home / Sync / Exit still work (an empty deck or
-        // a finished one must not strand you on a chrome-less screen).
-        None => ui::compose_review_empty(
-            renderer,
-            counts,
-            status,
-            "All done",
-            "No more cards due. Tap Sync to fetch, or Home for another deck.",
-        ),
-    };
+    }
+    let window = view.as_ref().unwrap().paint_window();
+    let model = models
+        .get(model_idx)
+        .map(|m| m.name.as_str())
+        .unwrap_or("Loading models…");
+    let frame = ui::compose_chat(renderer, &window, model, status, input, keyboard);
+    wb.set_ink_visible(!keyboard);
     wb.set_base(frame);
     wb.blit_full(qtfb);
 }
 
-/// The shown card html is changing (new card / phase flip / leaving review):
-/// drop the live view and reset the whiteboard's scroll/zoom anchoring.
-fn invalidate_view(view: &mut Option<CardView>, wb: &mut Whiteboard) {
-    *view = None;
-    wb.set_view(0.0, 1.0);
-}
-
-/// Filter the full deck tree to the rows visible given the runtime collapse state:
-/// a deck is hidden when any ancestor is collapsed. Each row's `collapsed` field is
-/// set to the runtime state so the chevron renders correctly.
-fn visible_decks(all: &[DeckInfo], collapsed: &HashSet<i64>) -> Vec<DeckInfo> {
-    let mut out = Vec::new();
-    let mut hide: Option<u32> = None; // hide decks deeper than this level
-    for d in all {
-        if let Some(h) = hide {
-            if d.level > h {
-                continue;
-            }
-            hide = None;
-        }
-        let is_collapsed = collapsed.contains(&d.id.0);
-        let mut row = d.clone();
-        row.collapsed = is_collapsed;
-        out.push(row);
-        if is_collapsed && d.has_children {
-            hide = Some(d.level);
-        }
+fn png_from_ink(wb: &Whiteboard) -> Result<Vec<u8>> {
+    let (width, height, rgba) = wb.ink_image();
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&rgba)?;
     }
-    out
-}
-
-/// Keep `scroll` within range after the visible list changes.
-fn clamp_scroll(scroll: &mut usize, len: usize) {
-    let max_scroll = len.saturating_sub(ui::home_page_rows());
-    if *scroll > max_scroll {
-        *scroll = max_scroll;
-    }
-}
-
-/// Combine the startup streak with this session's grades: `reviewed_today` adds
-/// the in-session count, and if nothing had been studied today at startup, the
-/// first grade extends the streak by one (today now counts).
-fn home_stats(base: Stats, session_reviews: u32) -> Stats {
-    let studied_today_at_start = base.reviewed_today > 0;
-    Stats {
-        reviewed_today: base.reviewed_today + session_reviews,
-        streak: if !studied_today_at_start && session_reviews > 0 {
-            base.streak + 1
-        } else {
-            base.streak
-        },
-    }
-}
-
-/// Read AnkiWeb credentials from `DATA_DIR/ankiweb.txt` (line 1 = email/user,
-/// line 2 = password) and run a sync. Error/credential problems come back as a
-/// report whose headline is the message (details all None).
-fn do_sync(backend: &mut Backend) -> SyncReport {
-    let creds_path = format!("{DATA_DIR}/ankiweb.txt");
-    let raw = match std::fs::read_to_string(&creds_path) {
-        Ok(s) => s,
-        Err(_) => {
-            return SyncReport {
-                headline: "no AnkiWeb creds (ankiweb.txt)".to_string(),
-                ..Default::default()
-            }
-        }
-    };
-    let mut lines = raw.lines();
-    let (Some(user), Some(pass)) = (lines.next(), lines.next()) else {
-        return SyncReport {
-            headline: "ankiweb.txt needs user + pass lines".to_string(),
-            ..Default::default()
-        };
-    };
-    match backend.sync(user.trim(), pass.trim()) {
-        Ok(r) => r,
-        Err(e) => SyncReport {
-            headline: format!("sync failed: {e}"),
-            ..Default::default()
-        },
-    }
-}
-
-/// The Some-detail lines of a sync report, newline-joined for the message body
-/// (and `|`-joined for logging). Empty when the sync had nothing to say.
-fn sync_report_body(r: &SyncReport) -> String {
-    [&r.added, &r.removed, &r.media, &r.server_message]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn wait_for_exit(qtfb: &Qtfb) {
-    while RUNNING.load(Ordering::SeqCst) {
-        match qtfb.poll_input() {
-            Ok(Some(ev)) => {
-                if ev.input_type == INPUT_TOUCH_PRESS {
-                    if let Hit::Exit = ui::hit_test(ev.x, ev.y, Phase::Question) {
-                        break;
-                    }
-                }
-            }
-            Ok(None) => continue,
-            Err(_) => break,
-        }
-    }
-}
-
-/// Block on a "tap anywhere to continue" screen: returns on any touch press (or
-/// shutdown). UPDATE/RELEASE are ignored; the pen fd isn't polled here — its
-/// samples just queue and get drained on the next main-loop iteration.
-fn wait_for_tap(qtfb: &mut Qtfb) {
-    while RUNNING.load(Ordering::SeqCst) {
-        match qtfb.poll_input() {
-            Ok(Some(ev)) => {
-                if ev.input_type == INPUT_TOUCH_PRESS {
-                    break;
-                }
-            }
-            Ok(None) => continue,
-            Err(_) => break,
-        }
-    }
+    Ok(png)
 }

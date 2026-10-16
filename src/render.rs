@@ -131,7 +131,13 @@ impl Renderer {
     /// `build_card_view` laid out directly at `ZOOM_STEPS[zoom_idx]` — the
     /// persisted zoom preference, so every card opens at the level you last
     /// pinched to instead of snapping back to 1.0×.
-    pub fn build_card_view_at(&self, html: &str, width: u32, height: u32, zoom_idx: usize) -> CardView {
+    pub fn build_card_view_at(
+        &self,
+        html: &str,
+        width: u32,
+        height: u32,
+        zoom_idx: usize,
+    ) -> CardView {
         let doc = self.build_document(html, width, height);
         let mut view = CardView {
             doc,

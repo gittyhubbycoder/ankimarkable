@@ -161,7 +161,12 @@ fn read_system() -> Option<bool> {
     if !fresh {
         return None;
     }
-    match std::fs::read_to_string(SYSTEM_FILE).ok()?.trim().parse::<i32>().ok()? {
+    match std::fs::read_to_string(SYSTEM_FILE)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()?
+    {
         0 => Some(false),
         180 => Some(true),
         _ => None,
