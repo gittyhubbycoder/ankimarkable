@@ -33,6 +33,13 @@ impl OpenRouter {
     /// Read the secret once from the application environment. Never log it.
     pub fn from_env() -> Result<Self> {
         let key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY is not set")?;
+        Self::with_key(key)
+    }
+
+    /// Build a client from an explicit key (used by `from_env` and by tests
+    /// that need a controlled bogus key without touching process env).
+    pub fn with_key(key: impl Into<String>) -> Result<Self> {
+        let key = key.into();
         if key.trim().is_empty() {
             bail!("OPENROUTER_API_KEY is empty");
         }
@@ -45,18 +52,21 @@ impl OpenRouter {
             key,
         })
     }
-
     /// Masked key hint safe to show on screen, e.g. `sk-or-v1-…abcd`.
     /// The full secret is never exposed; it lives in the launch environment.
+    /// Byte slicing is char-boundary safe so unusual keys cannot panic.
     pub fn key_hint(key: &str) -> String {
         let trimmed = key.trim();
         if trimmed.is_empty() {
             return "not set".to_string();
         }
-        if trimmed.len() <= 12 {
+        let chars: Vec<char> = trimmed.chars().collect();
+        if chars.len() <= 12 {
             return "set (short key)".to_string();
         }
-        format!("{}…{}", &trimmed[..7], &trimmed[trimmed.len() - 4..])
+        let head: String = chars[..7].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{head}…{tail}")
     }
 
     /// Free-only model catalog. A model counts as free when it is an explicit
@@ -235,12 +245,16 @@ async fn check_status(response: reqwest::Response, context: &str) -> Result<Valu
 }
 
 /// First `limit` chars of a body with whitespace collapsed, for error lines.
+/// Char-boundary safe: API bodies may contain multibyte text, and slicing
+/// mid-character would panic the network worker and wedge the UI busy state.
 pub fn snippet(text: &str, limit: usize) -> String {
     let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.len() <= limit {
+    let chars: Vec<char> = collapsed.chars().collect();
+    if chars.len() <= limit {
         collapsed
     } else {
-        format!("{}…", &collapsed[..limit])
+        let head: String = chars[..limit].iter().collect();
+        format!("{head}…")
     }
 }
 

@@ -1,4 +1,8 @@
 /.env
+# Never commit API keys.
+key.txt
+*.key
+/.env
 # Rust build output (aarch64-musl release artifacts).
 /target/
 /vendor/**/target/
