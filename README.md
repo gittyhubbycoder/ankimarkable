@@ -10,10 +10,21 @@ boot-bank risk.
   ink pad, then send it as transcribed text (*Send Ink-to-Text*) or as a raw
   image (*Send Image*, an inline `image_url` payload).
 - **On-screen keyboard** — toggle a touch QWERTY keyboard and type a normal
-  text prompt.
-- **Model picker** — the app loads every model from your OpenRouter account;
-  tap the header arrows to step through them, or tap the model name to jump
-  straight to a model.
+  text prompt. Includes a SHIFT key (tap for one capital letter) and
+  multi-tap punctuation keys: `, . ?` cycles `,` → `.` → `?` → `!`, and
+  `- / :` cycles `-` → `/` → `:`.
+- **Free-model picker** — the app lists only free OpenRouter models (`:free`
+  variants and zero-price models). Tap the header model name for a dropdown
+  list, or use the ◀ ▶ arrows to step through them.
+- **Settings menu (⚙)** — tap the gear in the header to see your masked API
+  key, run **Test API** (reports `API OK — N free models` or the full error),
+  change the model, adjust text size (A− / A+), and cycle the text colour
+  (Ink black / Navy / Sepia).
+- **Chat bubbles for everything** — your message appears instantly when you
+  press Send/⏎, a pending bubble shows while the network works, and the
+  answer *or the full error text* lands in its own bubble. No more truncated
+  header errors: failures are readable in the transcript and in the device
+  log.
 - **Markdown answers** — assistant replies render as real Markdown (headings,
   lists, code blocks, tables) through the on-device blitz/stylo HTML engine.
 - **Scrollable transcript** — tap the upper half of the chat area to scroll up,
@@ -102,8 +113,11 @@ Notes:
   startup — nothing is fetched or sent until you tap a Send button.
 - The key is stored as plain text on the device (anyone with root/SSH access
   can read the manifest). Don't reuse a high-limit production key.
-- No key set? The app still opens and the header reads
-  "Set OPENROUTER_API_KEY then relaunch".
+- No key set? The app still opens; the header reads "No API key" and
+  Settings shows the key as `not set`. Set the key and relaunch.
+- Key set but requests fail? The full error (HTTP status, API message, or
+  TLS/network detail) appears in an error bubble in the chat — open Settings
+  → Test API to re-check without sending a message.
 - Running the binary by hand over SSH instead? Just export the variable first:
   `OPENROUTER_API_KEY=sk-or-... ./openrouter-chat` (needs a `QTFB_KEY` from
   AppLoad, so the menu is the normal route).
@@ -114,9 +128,15 @@ Notes:
 
 | Control | What it does |
 |---|---|
-| Header ◀ ▶ | Previous / next model |
-| Header model name | Jump to a model at that position in the list |
+| Header ⚙ | Open the settings menu |
+| Header ◀ ▶ | Previous / next free model |
+| Header model name | Open the free-model dropdown (tap a row to select, ◀ Prev / Next ▶ to page) |
 | Header EXIT | Quit |
+| Settings → API TEST | Test the key: `API OK — N free models` or the full error |
+| Settings → MODEL | Current free model; tap to open the dropdown |
+| Settings → TEXT SIZE | Tap left half (A−) / right half (A+) to shrink/enlarge |
+| Settings → TEXT COLOUR | Tap to cycle Ink black → Navy → Sepia |
+| Keyboard SHIFT | Tap once: next letter is capital (auto-releases) |
 | Chat area, top half | Scroll transcript up |
 | Chat area, bottom half | Scroll transcript down |
 | Whiteboard pad | Write with the marker (flip the pen to erase) |
@@ -124,6 +144,11 @@ Notes:
 | **Send Image** | Sends the pad PNG inline as an `image_url` |
 | **Keyboard** | Toggles the on-screen QWERTY keyboard over the pad |
 | **Send Text** | Sends the typed prompt (keyboard mode) |
+| Keyboard-mode footer: OCR / Image / Ink Pad / Send | Same sends without leaving the keyboard; Ink Pad returns to the pen pad |
+| Keyboard SHIFT | One capital letter, then auto-releases |
+| Keyboard `, . ?` / `- / :` | Multi-tap cycling: `,`→`.`→`?`→`!` and `-`→`/`→`:` |
+| Settings footer: Test API / A− / A+ / Done | Test key, shrink/enlarge text, close |
+| Dropdown footer: ◀ Prev / Next ▶ / Done | Page the free-model list, close |
 
 Keyboard mode hides the pen pad; switch back with the same button to keep
 writing. Pen ink is preserved across mode switches.

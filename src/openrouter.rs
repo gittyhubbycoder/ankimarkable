@@ -46,19 +46,31 @@ impl OpenRouter {
         })
     }
 
+    /// Masked key hint safe to show on screen, e.g. `sk-or-v1-…abcd`.
+    /// The full secret is never exposed; it lives in the launch environment.
+    pub fn key_hint(key: &str) -> String {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return "not set".to_string();
+        }
+        if trimmed.len() <= 12 {
+            return "set (short key)".to_string();
+        }
+        format!("{}…{}", &trimmed[..7], &trimmed[trimmed.len() - 4..])
+    }
+
+    /// Free-only model catalog. A model counts as free when it is an explicit
+    /// `:free` variant, or when both its prompt and completion prices are zero.
+    /// Pricing values are decimal strings, so `"0"`, `"0.0"` etc. all count.
     pub async fn models(&self) -> Result<Vec<Model>> {
-        let value: Value = self
+        let response = self
             .client
             .get(format!("{API}/models"))
             .bearer_auth(&self.key)
             .send()
             .await
-            .context("request OpenRouter models")?
-            .error_for_status()
-            .context("OpenRouter model list returned an error")?
-            .json()
-            .await
-            .context("decode OpenRouter model list")?;
+            .context("request OpenRouter models: network/TLS failure")?;
+        let value: Value = check_status(response, "OpenRouter model list").await?;
         let list = value
             .get("data")
             .and_then(Value::as_array)
@@ -67,6 +79,9 @@ impl OpenRouter {
             .iter()
             .filter_map(|item| {
                 let id = item.get("id")?.as_str()?.to_string();
+                if !is_free_model(item) {
+                    return None;
+                }
                 if item
                     .get("architecture")
                     .and_then(|a| a.get("input_modalities"))
@@ -154,7 +169,7 @@ impl OpenRouter {
     }
 
     async fn completion(&self, body: Value) -> Result<String> {
-        let value: Value = self
+        let response = self
             .client
             .post(format!("{API}/chat/completions"))
             .bearer_auth(&self.key)
@@ -162,12 +177,8 @@ impl OpenRouter {
             .json(&body)
             .send()
             .await
-            .context("send OpenRouter chat request")?
-            .error_for_status()
-            .context("OpenRouter chat request returned an error")?
-            .json()
-            .await
-            .context("decode OpenRouter chat response")?;
+            .context("send OpenRouter chat request: network/TLS failure")?;
+        let value: Value = check_status(response, "OpenRouter chat request").await?;
         let content = &value["choices"][0]["message"]["content"];
         if let Some(text) = content.as_str() {
             return Ok(text.to_string());
@@ -183,9 +194,60 @@ impl OpenRouter {
     }
 }
 
+fn is_free_model(item: &Value) -> bool {
+    if item
+        .get("id")
+        .and_then(Value::as_str)
+        .map_or(false, |id| id.ends_with(":free"))
+    {
+        return true;
+    }
+    let price = |key: &str| {
+        item.get("pricing")
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    };
+    is_zero_price(price("prompt")) && is_zero_price(price("completion"))
+}
+
+fn is_zero_price(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.parse::<f64>().map_or(false, |v| v == 0.0)
+}
+
+/// Read the body once and report HTTP failures with status + a body snippet,
+/// so device-side errors (401/404/429/5xx) are distinguishable from TLS or
+/// network failures. Success responses are parsed as JSON.
+async fn check_status(response: reqwest::Response, context: &str) -> Result<Value> {
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .with_context(|| format!("{context}: read response body"))?;
+    if !status.is_success() {
+        bail!("{}: HTTP {}: {}", context, status, snippet(&text, 500));
+    }
+    serde_json::from_str(&text).with_context(|| format!("{context}: decode JSON response"))
+}
+
+/// First `limit` chars of a body with whitespace collapsed, for error lines.
+pub fn snippet(text: &str, limit: usize) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= limit {
+        collapsed
+    } else {
+        format!("{}…", &collapsed[..limit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn model_type_keeps_api_id_and_display_name() {
@@ -195,5 +257,32 @@ mod tests {
         };
         assert_eq!(model.id, "vendor/model");
         assert_eq!(model.name, "Model");
+    }
+
+    #[test]
+    fn free_filter_keeps_free_variant_and_zero_pricing() {
+        let free_suffix =
+            json!({"id": "x/y:free", "pricing": {"prompt": "0.1", "completion": "0.1"}});
+        let zero_price = json!({"id": "x/y", "pricing": {"prompt": "0", "completion": "0"}});
+        let paid = json!({"id": "x/y", "pricing": {"prompt": "0", "completion": "0.01"}});
+        let no_pricing = json!({"id": "x/y"});
+        assert!(is_free_model(&free_suffix));
+        assert!(is_free_model(&zero_price));
+        assert!(!is_free_model(&paid));
+        assert!(!is_free_model(&no_pricing));
+    }
+
+    #[test]
+    fn key_hint_masks_but_confirms_presence() {
+        assert_eq!(OpenRouter::key_hint(""), "not set");
+        assert_eq!(OpenRouter::key_hint("sk-or-v1-abcdef1234"), "sk-or-v…1234");
+    }
+
+    #[test]
+    fn error_snippet_collapses_and_truncates() {
+        let s = snippet("  a\n  b   c  ", 100);
+        assert_eq!(s, "a b c");
+        let long = "x".repeat(600);
+        assert!(snippet(&long, 500).ends_with("…"));
     }
 }

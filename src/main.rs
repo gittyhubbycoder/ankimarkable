@@ -14,7 +14,10 @@ use openrouter_chat::orient::OrientTracker;
 use openrouter_chat::pen::Pen;
 use openrouter_chat::qtfb::{Qtfb, INPUT_TOUCH_PRESS, INPUT_TOUCH_RELEASE, INPUT_TOUCH_UPDATE};
 use openrouter_chat::render::{CardView, Renderer};
-use openrouter_chat::ui::{self, ChatHit, ChatMessage};
+use openrouter_chat::ui::{
+    self, ChatFrame, ChatHit, ChatMessage, ModelEntry, COLOR_PRESETS, FONT_DEFAULT, FONT_MAX,
+    FONT_MIN,
+};
 use openrouter_chat::whiteboard::Whiteboard;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -25,6 +28,7 @@ extern "C" fn on_sigterm(_sig: i32) {
 #[derive(Debug)]
 enum NetCommand {
     LoadModels,
+    TestApi,
     Text {
         model: String,
         prompt: String,
@@ -45,14 +49,34 @@ enum NetCommand {
 #[derive(Debug)]
 enum NetEvent {
     Models(NetResult<Vec<Model>>),
+    ApiTest(NetResult<String>),
     Reply {
-        user_text: String,
         assistant: NetResult<String>,
     },
     InkReply {
         transcript: String,
         assistant: NetResult<String>,
     },
+}
+
+/// Punctuation groups for the `, . ?` and `- / :` keys: tapping the key appends
+/// the first mark, tapping again cycles through the rest in place.
+const COMMA_GROUP: [char; 4] = [',', '.', '?', '!'];
+const DASH_GROUP: [char; 3] = ['-', '/', ':'];
+
+/// Everything the frame composer needs beyond transcript/models/scroll.
+struct Chrome {
+    keyboard: bool,
+    shift: bool,
+    settings_open: bool,
+    model_open: bool,
+    model_page: usize,
+    font_size: u32,
+    color_idx: usize,
+    api_test: String,
+    key_hint: String,
+    status: String,
+    input: String,
 }
 
 fn main() {
@@ -96,14 +120,27 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
     let mut models: Vec<Model> = Vec::new();
     let mut model_idx = 0usize;
     let mut transcript: Vec<ChatMessage> = Vec::new();
-    let mut input = String::new();
-    let mut keyboard = false;
-    let mut busy = false;
-    let mut status = if std::env::var_os("OPENROUTER_API_KEY").is_some() {
-        "Loading models…".to_string()
-    } else {
-        "Set OPENROUTER_API_KEY then relaunch".to_string()
+    let mut chrome = Chrome {
+        keyboard: false,
+        shift: false,
+        settings_open: false,
+        model_open: false,
+        model_page: 0,
+        font_size: FONT_DEFAULT,
+        color_idx: 0,
+        api_test: String::new(),
+        key_hint: std::env::var("OPENROUTER_API_KEY")
+            .map(|key| OpenRouter::key_hint(&key))
+            .unwrap_or_else(|_| "not set".to_string()),
+        status: if std::env::var_os("OPENROUTER_API_KEY").is_some() {
+            "Loading models…".to_string()
+        } else {
+            "No API key".to_string()
+        },
+        input: String::new(),
     };
+    let mut busy = false;
+    let mut testing = false;
     let mut view: Option<CardView> = None;
     let mut transcript_scroll = 0.0;
     let mut last_pen: Option<Instant> = None;
@@ -132,9 +169,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
         &transcript,
         &models,
         model_idx,
-        &status,
-        &input,
-        keyboard,
+        &chrome,
         transcript_scroll,
     );
 
@@ -145,9 +180,14 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                     models = found;
                     if !models.is_empty() {
                         model_idx = initial_model(&models);
-                        status = format!("{} models", models.len());
+                        chrome.status = format!("{} free models", models.len());
                     } else {
-                        status = "No models returned".into();
+                        chrome.status = "No free models".into();
+                        transcript.push(ChatMessage {
+                            role: "assistant".into(),
+                            content: "⚠ The model list came back empty. Open Settings → Test API for details.".into(),
+                        });
+                        view = None;
                     }
                     redraw(
                         &mut qtfb,
@@ -157,14 +197,18 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
+                        &chrome,
                         transcript_scroll,
                     );
                 }
                 NetEvent::Models(Err(error)) => {
-                    status = format!("Model list: {error}");
+                    eprintln!("openrouter-chat: model list failed: {error}");
+                    chrome.status = "Model list failed".into();
+                    transcript.push(ChatMessage {
+                        role: "assistant".into(),
+                        content: format!("⚠ Could not load the model list:\n{error}"),
+                    });
+                    view = None;
                     redraw(
                         &mut qtfb,
                         &renderer,
@@ -173,35 +217,58 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
+                        &chrome,
+                        f64::INFINITY,
+                    );
+                }
+                NetEvent::ApiTest(result) => {
+                    testing = false;
+                    match result {
+                        Ok(summary) => {
+                            chrome.api_test = summary;
+                            chrome.status = "API OK".into();
+                        }
+                        Err(error) => {
+                            eprintln!("openrouter-chat: API test failed: {error}");
+                            chrome.api_test = format!("FAILED: {error}");
+                            chrome.status = "API test failed".into();
+                            transcript.push(ChatMessage {
+                                role: "assistant".into(),
+                                content: format!("⚠ API test failed:\n{error}"),
+                            });
+                            view = None;
+                        }
+                    }
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
                         transcript_scroll,
                     );
                 }
-                NetEvent::Reply {
-                    user_text,
-                    assistant,
-                } => {
+                NetEvent::Reply { assistant } => {
                     busy = false;
-                    transcript.push(ChatMessage {
-                        role: "user".into(),
-                        content: user_text,
-                    });
                     match assistant {
                         Ok(text) => {
-                            transcript.push(ChatMessage {
-                                role: "assistant".into(),
-                                content: text,
-                            });
-                            status = "Ready".into();
-                            if keyboard {
-                                input.clear();
+                            resolve_pending(&mut transcript, text);
+                            chrome.status = "Ready".into();
+                            if chrome.keyboard {
+                                chrome.input.clear();
                             } else {
                                 whiteboard.clear_ink();
                             }
+                            chrome.shift = false;
                         }
-                        Err(error) => status = format!("Request failed: {error}"),
+                        Err(error) => {
+                            eprintln!("openrouter-chat: chat request failed: {error}");
+                            resolve_pending(&mut transcript, format!("⚠ Request failed:\n{error}"));
+                            chrome.status = "Failed (see chat)".into();
+                        }
                     }
                     view = None;
                     redraw(
@@ -212,10 +279,8 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
-                        0.0,
+                        &chrome,
+                        f64::INFINITY,
                     );
                 }
                 NetEvent::InkReply {
@@ -225,18 +290,23 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                     busy = false;
                     match assistant {
                         Ok(text) => {
-                            transcript.push(ChatMessage {
-                                role: "user".into(),
-                                content: format!("(ink OCR) {recognized}"),
-                            });
-                            transcript.push(ChatMessage {
-                                role: "assistant".into(),
-                                content: text,
-                            });
-                            status = "Ink sent".into();
+                            if transcript.len() >= 2 {
+                                let user_at = transcript.len() - 2;
+                                transcript[user_at].content = format!("(ink OCR) {recognized}");
+                            }
+                            resolve_pending(&mut transcript, text);
+                            chrome.status = "Ink sent".into();
                             whiteboard.clear_ink();
+                            chrome.shift = false;
                         }
-                        Err(error) => status = format!("Ink request failed: {error}"),
+                        Err(error) => {
+                            eprintln!("openrouter-chat: ink request failed: {error}");
+                            resolve_pending(
+                                &mut transcript,
+                                format!("⚠ Ink request failed:\n{error}"),
+                            );
+                            chrome.status = "Failed (see chat)".into();
+                        }
                     }
                     view = None;
                     redraw(
@@ -247,10 +317,8 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
-                        0.0,
+                        &chrome,
+                        f64::INFINITY,
                     );
                 }
             }
@@ -339,19 +407,28 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
             if pen_active && (ev.y as usize) >= ui::INK_Y && (ev.y as usize) < ui::FOOTER_Y {
                 continue;
             }
-            match ui::hit_test(ev.x, ev.y, keyboard) {
+            let hit = ui::hit_test(
+                ev.x,
+                ev.y,
+                chrome.keyboard,
+                chrome.shift,
+                chrome.settings_open,
+                chrome.model_open,
+                models.len(),
+                model_page(&models, chrome.model_page),
+            );
+            match hit {
                 ChatHit::Exit => break 'main,
                 ChatHit::ModelPrevious | ChatHit::ModelNext => {
                     if !models.is_empty() {
-                        model_idx =
-                            if matches!(ui::hit_test(ev.x, ev.y, keyboard), ChatHit::ModelPrevious)
-                            {
-                                (model_idx + models.len() - 1) % models.len()
-                            } else {
-                                (model_idx + 1) % models.len()
-                            };
+                        model_idx = if matches!(hit, ChatHit::ModelPrevious) {
+                            (model_idx + models.len() - 1) % models.len()
+                        } else {
+                            (model_idx + 1) % models.len()
+                        };
+                        chrome.model_page = model_idx / ui::MODELS_PER_PAGE;
                     }
-                    status = "Model selected".into();
+                    chrome.status = "Model selected".into();
                     redraw(
                         &mut qtfb,
                         &renderer,
@@ -360,18 +437,18 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
+                        &chrome,
                         transcript_scroll,
                     );
                 }
-                ChatHit::ModelSelect(x) => {
-                    if !models.is_empty() {
-                        let picker = x.saturating_sub(362);
-                        let width = ui::WIDTH.saturating_sub(362 + 224).max(1);
-                        model_idx = (picker * models.len() / width).min(models.len() - 1);
-                        status = format!("{} selected", models[model_idx].name);
+                ChatHit::ModelToggle => {
+                    if models.is_empty() {
+                        chrome.status = "Loading models…".into();
+                    } else {
+                        chrome.model_open = !chrome.model_open;
+                        if chrome.model_open {
+                            chrome.model_page = model_idx / ui::MODELS_PER_PAGE;
+                        }
                     }
                     redraw(
                         &mut qtfb,
@@ -381,9 +458,195 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::OpenSettings => {
+                    chrome.settings_open = true;
+                    chrome.model_open = false;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::CloseSettings => {
+                    chrome.settings_open = false;
+                    chrome.model_open = false;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::TestApi => {
+                    if testing {
+                        continue;
+                    }
+                    if models.is_empty() && chrome.key_hint == "not set" {
+                        chrome.api_test =
+                            "No API key — set OPENROUTER_API_KEY and relaunch.".to_string();
+                        chrome.status = "No API key".into();
+                    } else if command_tx.send(NetCommand::TestApi).is_ok() {
+                        chrome.api_test = "Testing…".to_string();
+                        chrome.status = "Testing API…".into();
+                        testing = true;
+                    } else {
+                        chrome.api_test =
+                            "Network worker is not running — relaunch the app.".to_string();
+                        chrome.status = "No network worker".into();
+                    }
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::FontBigger => {
+                    chrome.font_size = (chrome.font_size + 4).min(FONT_MAX);
+                    view = None;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::FontSmaller => {
+                    chrome.font_size = chrome.font_size.saturating_sub(4).max(FONT_MIN);
+                    view = None;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::ColorNext => {
+                    chrome.color_idx = (chrome.color_idx + 1) % COLOR_PRESETS.len();
+                    view = None;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::OpenModels => {
+                    if models.is_empty() {
+                        chrome.status = "Loading models…".into();
+                    } else {
+                        chrome.model_open = true;
+                        chrome.model_page = model_idx / ui::MODELS_PER_PAGE;
+                    }
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::CloseModels => {
+                    chrome.model_open = false;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::ModelPage(delta) => {
+                    let pages =
+                        ((models.len() + ui::MODELS_PER_PAGE - 1) / ui::MODELS_PER_PAGE).max(1);
+                    let current = model_page(&models, chrome.model_page) % pages;
+                    let next = (current as i32 + delta).rem_euclid(pages as i32) as usize;
+                    chrome.model_page = next;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::ModelPick(idx) => {
+                    if idx < models.len() {
+                        model_idx = idx;
+                        chrome.model_page = idx / ui::MODELS_PER_PAGE;
+                        chrome.status = format!("{} selected", models[model_idx].name);
+                    }
+                    chrome.model_open = false;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        transcript_scroll,
+                    );
+                }
+                ChatHit::Shift => {
+                    chrome.shift = !chrome.shift;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
                         transcript_scroll,
                     );
                 }
@@ -402,8 +665,9 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                     }
                 }
                 ChatHit::ToggleKeyboard => {
-                    keyboard = !keyboard;
-                    whiteboard.set_ink_visible(!keyboard);
+                    chrome.keyboard = !chrome.keyboard;
+                    chrome.shift = false;
+                    whiteboard.set_ink_visible(!chrome.keyboard);
                     redraw(
                         &mut qtfb,
                         &renderer,
@@ -412,15 +676,16 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
+                        &chrome,
                         transcript_scroll,
                     );
                 }
                 ChatHit::SendInkOcr => {
-                    if !busy && !whiteboard.ink_present() {
-                        status = "Write something on the pad first".into();
+                    if busy {
+                        continue;
+                    }
+                    if !whiteboard.ink_present() {
+                        chrome.status = "Write on the pad first".into();
                         redraw(
                             &mut qtfb,
                             &renderer,
@@ -429,29 +694,52 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                             &transcript,
                             &models,
                             model_idx,
-                            &status,
-                            &input,
-                            keyboard,
+                            &chrome,
                             transcript_scroll,
                         );
                         continue;
                     }
-                    if !busy {
-                        match png_from_ink(&whiteboard) {
-                            Ok(png) => dispatch(
+                    match png_from_ink(&whiteboard) {
+                        Ok(png) => {
+                            let name = model_name(&models, model_idx);
+                            push_pending(
+                                &mut transcript,
+                                "(✎ handwriting on pad) sending…",
+                                &format!("Sending to {name}…"),
+                            );
+                            view = None;
+                            redraw(
+                                &mut qtfb,
+                                &renderer,
+                                &mut whiteboard,
+                                &mut view,
+                                &transcript,
+                                &models,
+                                model_idx,
+                                &chrome,
+                                f64::INFINITY,
+                            );
+                            dispatch(
                                 &command_tx,
                                 &models,
                                 model_idx,
                                 NetCommand::InkOcr {
                                     model: selected_id(&models, model_idx),
                                     png,
-                                    history: history(&transcript),
+                                    history: history(&transcript_for_api(&transcript)),
                                 },
                                 &mut busy,
-                                &mut status,
-                            ),
-                            Err(error) => status = format!("{error:#}"),
+                                &mut chrome.status,
+                            );
+                            if !busy {
+                                // Dispatch refused (model list not ready): drop the
+                                // optimistic bubbles again.
+                                transcript.pop();
+                                transcript.pop();
+                                view = None;
+                            }
                         }
+                        Err(error) => chrome.status = format!("{error:#}"),
                     }
                     redraw(
                         &mut qtfb,
@@ -461,15 +749,20 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
-                        transcript_scroll,
+                        &chrome,
+                        if busy {
+                            f64::INFINITY
+                        } else {
+                            transcript_scroll
+                        },
                     );
                 }
                 ChatHit::SendImage => {
-                    if !busy && !whiteboard.ink_present() {
-                        status = "Write something on the pad first".into();
+                    if busy {
+                        continue;
+                    }
+                    if !whiteboard.ink_present() {
+                        chrome.status = "Write on the pad first".into();
                         redraw(
                             &mut qtfb,
                             &renderer,
@@ -478,16 +771,32 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                             &transcript,
                             &models,
                             model_idx,
-                            &status,
-                            &input,
-                            keyboard,
+                            &chrome,
                             transcript_scroll,
                         );
                         continue;
                     }
-                    if !busy {
-                        match png_from_ink(&whiteboard) {
-                            Ok(png) => dispatch(
+                    match png_from_ink(&whiteboard) {
+                        Ok(png) => {
+                            let name = model_name(&models, model_idx);
+                            push_pending(
+                                &mut transcript,
+                                "🖼 handwritten image sending…",
+                                &format!("Sending to {name}…"),
+                            );
+                            view = None;
+                            redraw(
+                                &mut qtfb,
+                                &renderer,
+                                &mut whiteboard,
+                                &mut view,
+                                &transcript,
+                                &models,
+                                model_idx,
+                                &chrome,
+                                f64::INFINITY,
+                            );
+                            dispatch(
                                 &command_tx,
                                 &models,
                                 model_idx,
@@ -496,13 +805,18 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                                     prompt: "Please analyze my handwritten note/image and respond."
                                         .into(),
                                     png,
-                                    history: history(&transcript),
+                                    history: history(&transcript_for_api(&transcript)),
                                 },
                                 &mut busy,
-                                &mut status,
-                            ),
-                            Err(error) => status = format!("{error:#}"),
+                                &mut chrome.status,
+                            );
+                            if !busy {
+                                transcript.pop();
+                                transcript.pop();
+                                view = None;
+                            }
                         }
+                        Err(error) => chrome.status = format!("{error:#}"),
                     }
                     redraw(
                         &mut qtfb,
@@ -512,27 +826,49 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
-                        transcript_scroll,
+                        &chrome,
+                        if busy {
+                            f64::INFINITY
+                        } else {
+                            transcript_scroll
+                        },
                     );
                 }
                 ChatHit::SendText => {
-                    if !busy && !input.trim().is_empty() {
-                        let prompt = std::mem::take(&mut input);
-                        dispatch(
-                            &command_tx,
-                            &models,
-                            model_idx,
-                            NetCommand::Text {
-                                model: selected_id(&models, model_idx),
-                                prompt,
-                                history: history(&transcript),
-                            },
-                            &mut busy,
-                            &mut status,
-                        );
+                    if busy || chrome.input.trim().is_empty() {
+                        continue;
+                    }
+                    let prompt = std::mem::take(&mut chrome.input);
+                    let name = model_name(&models, model_idx).to_string();
+                    push_pending(&mut transcript, &prompt, &format!("Sending to {name}…"));
+                    view = None;
+                    redraw(
+                        &mut qtfb,
+                        &renderer,
+                        &mut whiteboard,
+                        &mut view,
+                        &transcript,
+                        &models,
+                        model_idx,
+                        &chrome,
+                        f64::INFINITY,
+                    );
+                    dispatch(
+                        &command_tx,
+                        &models,
+                        model_idx,
+                        NetCommand::Text {
+                            model: selected_id(&models, model_idx),
+                            prompt,
+                            history: history(&transcript_for_api(&transcript)),
+                        },
+                        &mut busy,
+                        &mut chrome.status,
+                    );
+                    if !busy {
+                        transcript.pop();
+                        transcript.pop();
+                        view = None;
                     }
                     redraw(
                         &mut qtfb,
@@ -542,20 +878,40 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
-                        transcript_scroll,
+                        &chrome,
+                        if busy {
+                            f64::INFINITY
+                        } else {
+                            transcript_scroll
+                        },
                     );
                 }
                 ChatHit::Key(token) => {
                     match token {
                         "Backspace" => {
-                            input.pop();
+                            chrome.input.pop();
                         }
                         "Enter" => {
-                            if !busy && !input.trim().is_empty() {
-                                let prompt = std::mem::take(&mut input);
+                            if !busy && !chrome.input.trim().is_empty() {
+                                let prompt = std::mem::take(&mut chrome.input);
+                                let name = model_name(&models, model_idx).to_string();
+                                push_pending(
+                                    &mut transcript,
+                                    &prompt,
+                                    &format!("Sending to {name}…"),
+                                );
+                                view = None;
+                                redraw(
+                                    &mut qtfb,
+                                    &renderer,
+                                    &mut whiteboard,
+                                    &mut view,
+                                    &transcript,
+                                    &models,
+                                    model_idx,
+                                    &chrome,
+                                    f64::INFINITY,
+                                );
                                 dispatch(
                                     &command_tx,
                                     &models,
@@ -563,14 +919,29 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                                     NetCommand::Text {
                                         model: selected_id(&models, model_idx),
                                         prompt,
-                                        history: history(&transcript),
+                                        history: history(&transcript_for_api(&transcript)),
                                     },
                                     &mut busy,
-                                    &mut status,
+                                    &mut chrome.status,
                                 );
+                                if !busy {
+                                    transcript.pop();
+                                    transcript.pop();
+                                    view = None;
+                                }
                             }
                         }
-                        t => input.push_str(t),
+                        "PunctComma" => cycle_punct(&mut chrome.input, &COMMA_GROUP),
+                        "PunctDash" => cycle_punct(&mut chrome.input, &DASH_GROUP),
+                        t => {
+                            chrome.input.push_str(t);
+                            if chrome.shift
+                                && t.len() == 1
+                                && t.chars().all(|c| c.is_ascii_uppercase())
+                            {
+                                chrome.shift = false;
+                            }
+                        }
                     }
                     redraw(
                         &mut qtfb,
@@ -580,9 +951,7 @@ fn run(mut qtfb: Qtfb) -> Result<()> {
                         &transcript,
                         &models,
                         model_idx,
-                        &status,
-                        &input,
-                        keyboard,
+                        &chrome,
                         transcript_scroll,
                     );
                 }
@@ -613,6 +982,13 @@ fn spawn_network_worker(api: OpenRouter, commands: Receiver<NetCommand>, events:
                         let result = runtime.block_on(api.models()).map_err(|e| format!("{e:#}"));
                         let _ = events.send(NetEvent::Models(result));
                     }
+                    NetCommand::TestApi => {
+                        let summary = runtime
+                            .block_on(api.models())
+                            .map(|found| format!("API OK — {} free models loaded.", found.len()));
+                        let _ =
+                            events.send(NetEvent::ApiTest(summary.map_err(|e| format!("{e:#}"))));
+                    }
                     NetCommand::Text {
                         model,
                         prompt,
@@ -621,15 +997,12 @@ fn spawn_network_worker(api: OpenRouter, commands: Receiver<NetCommand>, events:
                         let mut messages = history;
                         messages.push(Message {
                             role: "user".into(),
-                            content: prompt.clone(),
+                            content: prompt,
                         });
                         let assistant = runtime
                             .block_on(api.complete(&model, &messages))
                             .map_err(|e| format!("{e:#}"));
-                        let _ = events.send(NetEvent::Reply {
-                            user_text: prompt,
-                            assistant,
-                        });
+                        let _ = events.send(NetEvent::Reply { assistant });
                     }
                     NetCommand::InkOcr {
                         model,
@@ -663,15 +1036,93 @@ fn spawn_network_worker(api: OpenRouter, commands: Receiver<NetCommand>, events:
                         let assistant = runtime
                             .block_on(api.send_image(&model, &history, &prompt, &png))
                             .map_err(|e| format!("{e:#}"));
-                        let _ = events.send(NetEvent::Reply {
-                            user_text: format!("{prompt} [handwritten image attached]"),
-                            assistant,
-                        });
+                        let _ = events.send(NetEvent::Reply { assistant });
                     }
                 }
             }
         })
         .expect("spawn network worker");
+}
+
+/// Show the user's message immediately plus a pending assistant bubble, so the
+/// send is visible before the network round-trip completes.
+fn push_pending(transcript: &mut Vec<ChatMessage>, user_text: &str, wait_label: &str) {
+    transcript.push(ChatMessage {
+        role: "user".into(),
+        content: user_text.to_string(),
+    });
+    transcript.push(ChatMessage {
+        role: "assistant".into(),
+        content: wait_label.to_string(),
+    });
+}
+
+/// Swap the pending assistant bubble for the real response or a full error.
+fn resolve_pending(transcript: &mut Vec<ChatMessage>, assistant_text: String) {
+    if transcript
+        .last()
+        .map_or(false, |message| message.role == "assistant")
+    {
+        transcript.pop();
+    }
+    transcript.push(ChatMessage {
+        role: "assistant".into(),
+        content: assistant_text,
+    });
+}
+
+/// History for the API, excluding our own optimistic/pending bubbles: the
+/// worker re-appends the prompt/transcription itself.
+fn transcript_for_api(transcript: &[ChatMessage]) -> Vec<ChatMessage> {
+    if transcript.len() >= 2
+        && transcript[transcript.len() - 1].role == "assistant"
+        && transcript[transcript.len() - 2].role == "user"
+    {
+        transcript[..transcript.len() - 2].to_vec()
+    } else {
+        transcript.to_vec()
+    }
+}
+
+/// Cycle a punctuation key group in place: `,` → `.` → `?` → `!` → `,` …
+fn cycle_punct(input: &mut String, group: &[char]) {
+    if let Some(last) = input.chars().last() {
+        if let Some(pos) = group.iter().position(|&mark| mark == last) {
+            input.pop();
+            input.push(group[(pos + 1) % group.len()]);
+            return;
+        }
+    }
+    input.push(group[0]);
+}
+
+fn model_page(models: &[Model], page: usize) -> usize {
+    let pages = ((models.len() + ui::MODELS_PER_PAGE - 1) / ui::MODELS_PER_PAGE).max(1);
+    page.min(pages - 1)
+}
+
+fn model_entries(models: &[Model]) -> Vec<ModelEntry> {
+    models
+        .iter()
+        .map(|model| ModelEntry {
+            id: model.id.clone(),
+            name: model.name.clone(),
+        })
+        .collect()
+}
+
+fn color_hex(chrome: &Chrome) -> &str {
+    COLOR_PRESETS
+        .get(chrome.color_idx % COLOR_PRESETS.len())
+        .map(|(_, hex)| *hex)
+        .unwrap_or("#171717")
+}
+
+fn model_name<'a>(models: &'a [Model], idx: usize) -> &'a str {
+    models
+        .get(idx)
+        .map(|model| model.name.as_str())
+        .unwrap_or("Loading models…")
 }
 
 fn selected_id(models: &[Model], idx: usize) -> String {
@@ -728,19 +1179,19 @@ fn draw(
     messages: &[ChatMessage],
     models: &[Model],
     model_idx: usize,
-    status: &str,
-    input: &str,
-    keyboard: bool,
+    chrome: &Chrome,
     scroll: f64,
 ) {
-    let html = ui::transcript_html(messages);
+    let html = ui::transcript_html(messages, chrome.font_size, color_hex(chrome));
     let mut v = renderer.build_card_view(&html, ui::WIDTH as u32, ui::CARD_H as u32);
-    if scroll > 0.0 {
+    if scroll.is_infinite() {
+        v.scroll_by(1e9);
+    } else if scroll > 0.0 {
         v.scroll_by(scroll);
     }
     *view = Some(v);
     redraw(
-        qtfb, renderer, wb, view, messages, models, model_idx, status, input, keyboard, scroll,
+        qtfb, renderer, wb, view, messages, models, model_idx, chrome, scroll,
     );
 }
 
@@ -752,25 +1203,42 @@ fn redraw(
     messages: &[ChatMessage],
     models: &[Model],
     model_idx: usize,
-    status: &str,
-    input: &str,
-    keyboard: bool,
+    chrome: &Chrome,
     scroll: f64,
 ) {
     if view.is_none() {
-        let html = ui::transcript_html(messages);
-        *view = Some(renderer.build_card_view(&html, ui::WIDTH as u32, ui::CARD_H as u32));
-        if scroll > 0.0 {
-            view.as_mut().unwrap().scroll_by(scroll);
+        let html = ui::transcript_html(messages, chrome.font_size, color_hex(chrome));
+        let mut v = renderer.build_card_view(&html, ui::WIDTH as u32, ui::CARD_H as u32);
+        if scroll.is_infinite() {
+            v.scroll_by(1e9);
+        } else if scroll > 0.0 {
+            v.scroll_by(scroll);
         }
+        *view = Some(v);
     }
     let window = view.as_ref().unwrap().paint_window();
-    let model = models
-        .get(model_idx)
-        .map(|m| m.name.as_str())
-        .unwrap_or("Loading models…");
-    let frame = ui::compose_chat(renderer, &window, model, status, input, keyboard);
-    wb.set_ink_visible(!keyboard);
+    let entries = model_entries(models);
+    let frame = ui::compose_chat(
+        renderer,
+        &ChatFrame {
+            transcript_window: &window,
+            model_name: model_name(models, model_idx),
+            status: &chrome.status,
+            input_text: &chrome.input,
+            keyboard: chrome.keyboard,
+            shift: chrome.shift,
+            settings_open: chrome.settings_open,
+            model_open: chrome.model_open,
+            models: &entries,
+            model_idx,
+            model_page: model_page(models, chrome.model_page),
+            key_hint: &chrome.key_hint,
+            api_test: &chrome.api_test,
+            font_size: chrome.font_size,
+            color_idx: chrome.color_idx % COLOR_PRESETS.len(),
+        },
+    );
+    wb.set_ink_visible(!chrome.keyboard && !chrome.settings_open && !chrome.model_open);
     wb.set_base(frame);
     wb.blit_full(qtfb);
 }

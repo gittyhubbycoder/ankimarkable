@@ -75,8 +75,9 @@ OpenRouter Chat — reMarkable Paper Pro
 3. Launch it: XOVI menu -> AppLoad -> "OpenRouter Chat".
 
 The API key is stored as plain text on the device; anyone with root/SSH
-access can read it. Without a key the app still opens and shows
-"Set OPENROUTER_API_KEY then relaunch" in the header.
+access can read it. Without a key the app still opens and the header
+shows "No API key". Tap the gear icon for Settings: check the masked
+key, run Test API, pick a free model, and adjust text size/colour.
 EOF
 
 echo "==> Packing tarball"
